@@ -5,15 +5,18 @@ import android.accessibilityservice.GestureDescription
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.util.Log
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -21,6 +24,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 import kotlin.random.Random
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import com.tigercode.evcollector.CollectionStatusNotifier
 import com.tigercode.evcollector.core.model.NodeSnapshot
 import com.tigercode.evcollector.core.model.PageKind
@@ -152,6 +159,64 @@ class ChargingAccessibilityService : AccessibilityService() {
             refresh(root)
         } finally {
             root.recycle()
+        }
+    }
+
+    /** Local-only screenshot fallback for image advertisements; never uploads screen pixels. */
+    internal suspend fun observeBaiduPromotion(
+        snapshot: NodeSnapshot,
+        inspectImage: Boolean,
+    ): BaiduPromotionDetector.Observation {
+        BaiduPromotionDetector.fromNodes(snapshot, screenWidthPx(), screenHeightPx())?.let {
+            return BaiduPromotionDetector.Observation(it)
+        }
+        if (!inspectImage || Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isAmapWindowActive()) {
+            return BaiduPromotionDetector.Observation(null)
+        }
+        val bitmap = captureBaiduScreen() ?: return BaiduPromotionDetector.Observation(null)
+        return try {
+            withContext(Dispatchers.Default) {
+                BaiduPromotionDetector.Observation(BaiduPromotionDetector.fromImage(bitmap), imageChecked = true)
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private suspend fun captureBaiduScreen(): Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return withTimeoutOrNull(1_800L) {
+            suspendCancellableCoroutine { continuation ->
+                try {
+                    takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                        override fun onSuccess(result: ScreenshotResult) {
+                            var bitmap: Bitmap? = null
+                            try {
+                                val hardware = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                                try {
+                                    bitmap = hardware?.copy(Bitmap.Config.ARGB_8888, false)
+                                } finally {
+                                    hardware?.recycle()
+                                }
+                            } catch (error: Exception) {
+                                Log.w("EvCollector", "读取广告图像失败：${error.message}")
+                            } finally {
+                                result.hardwareBuffer.close()
+                            }
+                            if (continuation.isActive) {
+                                continuation.resume(bitmap) { _, value, _ -> value?.recycle() }
+                            } else bitmap?.recycle()
+                        }
+
+                        override fun onFailure(errorCode: Int) {
+                            if (continuation.isActive) continuation.resume(null) { _, _, _ -> }
+                        }
+                    })
+                } catch (error: Exception) {
+                    Log.w("EvCollector", "本机广告图像识别不可用：${error.message}")
+                    if (continuation.isActive) continuation.resume(null) { _, _, _ -> }
+                }
+            }
         }
     }
 

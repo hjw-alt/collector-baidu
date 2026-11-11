@@ -82,6 +82,14 @@ class MainActivity : AppCompatActivity() {
         binding.districtInput.setText("")
         binding.keywordInput.setText("")
 
+        binding.slowDeviceSwitch.isChecked = AppPreferences.slowDeviceMode(this)
+        binding.slowDeviceSwitch.setOnCheckedChangeListener { _, enabled ->
+            AppPreferences.setSlowDeviceMode(this, enabled)
+            AppPreferences.appendLog(this,
+                if (enabled) "已启用本机慢速模式：页面操作额外等待2～5秒"
+                else "已关闭本机慢速模式：恢复常规等待")
+            refreshUi()
+        }
         binding.saveConfigButton.setOnClickListener { saveConfig() }
         binding.openAccessibilityButton.setOnClickListener { openAccessibilitySettings() }
         binding.openAmapButton.setOnClickListener { openAmap() }
@@ -586,6 +594,7 @@ class MainActivity : AppCompatActivity() {
         val accessibilityConnected = ChargingAccessibilityService.isConnected()
         val accessibilityEnabled = ChargingAccessibilityService.isEnabled(this)
         val scanning = AppPreferences.isScanning(this)
+        binding.slowDeviceSwitch.isEnabled = !scanning && !engine.isRunning()
         binding.startHenanCollectButton.isEnabled = !scanning
         binding.startMonitorCollectButton.isEnabled = !scanning
         binding.startMonitorListButton.isEnabled = !scanning
@@ -600,6 +609,8 @@ class MainActivity : AppCompatActivity() {
             )
             append("\n设备调度: ")
             append(if (scanning) "运行中" else "已停止")
+            append("\n本机等待: ")
+            append(if (AppPreferences.slowDeviceMode(this@MainActivity)) "慢速（每步额外2～5秒）" else "常规")
             append("\n采集模式: ")
             append(if (AppPreferences.isMonitorMode(this@MainActivity)) "重点站点小时监控" else "普通任务调度")
             append("\n本地任务: 待采集 ")

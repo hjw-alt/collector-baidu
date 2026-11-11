@@ -26,6 +26,15 @@
             android:textColor="#496158"
             android:textSize="14sp" />
 
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/slow_device_switch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="老设备慢速模式（每步额外等待2～5秒）"
+            android:textColor="#173D2C"
+            android:textSize="14sp" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

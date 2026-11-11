@@ -174,6 +174,7 @@ class SyncManager(
                             latitude = task.stationLatitude,
                             longitude = task.stationLongitude,
                             remoteTaskId = task.id,
+                            dailyTariff = task.dailyTariff,
                         ) ?: throw IllegalStateException("未采集到目标站点: $requestedName")
                         listOf(detail)
                     } else if (
@@ -188,6 +189,7 @@ class SyncManager(
                             latitude = task.stationLatitude,
                             longitude = task.stationLongitude,
                             remoteTaskId = task.id,
+                            dailyTariff = task.dailyTariff,
                         ) ?: throw IllegalStateException("未采集到目标站点: $requestedName")
                         listOf(detail)
                     } else {

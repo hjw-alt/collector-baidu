@@ -16,6 +16,7 @@ object AppPreferences {
     private const val KEY_ACTIVATION_CODE = "activation_code"
     private const val KEY_DEVICE_NAME = "device_name"
     private const val KEY_DEVICE_TOKEN = "device_token"
+    private const val KEY_SLOW_DEVICE_MODE = "slow_device_mode"
     private const val KEY_SCANNING = "scanning"
     private const val KEY_REMOTE_STATUS = "remote_status"
     private const val KEY_REMOTE_ERROR = "remote_error"
@@ -48,7 +49,7 @@ object AppPreferences {
 
     private fun isPreviousLanServerUrl(value: String): Boolean {
         val uri = runCatching { Uri.parse(value) }.getOrNull()
-        return uri?.host == "192.0.2.27" && (uri.port == -1 || uri.port == 8800)
+        return uri?.host == "192.0.2.1" && (uri.port == -1 || uri.port == 8800)
     }
 
     fun normalizeServerUrl(value: String): String? {
@@ -64,6 +65,15 @@ object AppPreferences {
             .edit()
             .putString(KEY_SERVER_URL, normalized)
             .apply()
+    }
+
+    fun slowDeviceMode(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SLOW_DEVICE_MODE, false)
+
+    fun setSlowDeviceMode(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_SLOW_DEVICE_MODE, enabled).apply()
     }
 
     fun deviceCode(context: Context): String {

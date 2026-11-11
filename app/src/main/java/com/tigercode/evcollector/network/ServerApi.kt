@@ -62,6 +62,7 @@ data class RemoteTaskDto(
     @SerializedName("stationLatitude") val stationLatitude: Double? = null,
     @SerializedName("stationLongitude") val stationLongitude: Double? = null,
     @SerializedName("stationSequence") val stationSequence: Int = 0,
+    @SerializedName("dailyTariff") val dailyTariff: com.tigercode.evcollector.core.engine.DailyTariffCache? = null,
     @SerializedName("sourcePayload") val sourcePayload: Map<String, Any> = emptyMap(),
 )
 

@@ -1,11 +1,15 @@
 package com.tigercode.evcollector.engine
 
+import com.tigercode.evcollector.core.engine.DailyTariffCache
+import com.tigercode.evcollector.core.engine.DailyTariffPolicy
+
 import android.content.Context
 import android.os.SystemClock
 import com.google.gson.Gson
 import com.tigercode.evcollector.AppPreferences
 import com.tigercode.evcollector.CollectionStatusNotifier
 import com.tigercode.evcollector.accessibility.ChargingAccessibilityService
+import com.tigercode.evcollector.core.engine.DeviceUiPacingPolicy
 import com.tigercode.evcollector.core.model.CityDistricts
 import com.tigercode.evcollector.core.model.NodeSnapshot
 import com.tigercode.evcollector.core.model.PricePeriod
@@ -22,8 +26,6 @@ import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -78,7 +80,7 @@ fun interface CollectionListener {
 }
 
 /**
- * 百度地图采集：站点详情 -> 电桩卡片空闲/忙碌汇总 -> 分时电价。
+ * 百度地图采集：站点详情 -> 首页电桩卡片状态 -> 分时电价。
  */
 class CollectionEngine(
     private val context: Context,
@@ -97,6 +99,25 @@ class CollectionEngine(
                 add("${city}市")
                 addAll(districts)
             }
+        }
+    }
+
+    private val uiPacing: DeviceUiPacingPolicy
+        get() = DeviceUiPacingPolicy(AppPreferences.slowDeviceMode(context))
+
+    private fun uiTimeout(baseMs: Long): Long = uiPacing.timeoutMs(baseMs)
+
+    /** Add time only after UI actions; keep polling, lease renewal and stopping responsive. */
+    private suspend fun settleUi(stage: String, baseMs: Long = 0L) {
+        val extraMs = uiPacing.extraDelayMs()
+        if (extraMs > 0L) AppPreferences.appendLog(context,
+            "本机慢速模式：$stage，额外等待${extraMs}毫秒")
+        val deadline = SystemClock.uptimeMillis() + baseMs + extraMs
+        while (true) {
+            checkStop()
+            val remainingMs = deadline - SystemClock.uptimeMillis()
+            if (remainingMs <= 0L) return
+            delay(minOf(100L, remainingMs))
         }
     }
 
@@ -199,7 +220,8 @@ class CollectionEngine(
         latitude: Double?,
         longitude: Double?,
         remoteTaskId: String,
-    ): StationDetail? = runStationTask(stationId, stationName, address, latitude, longitude, remoteTaskId)
+        dailyTariff: DailyTariffCache? = null,
+    ): StationDetail? = runStationTask(stationId, stationName, address, latitude, longitude, remoteTaskId, dailyTariff)
 
     suspend fun runStationTask(
         stationId: String,
@@ -208,17 +230,18 @@ class CollectionEngine(
         latitude: Double?,
         longitude: Double?,
         remoteTaskId: String,
+        dailyTariff: DailyTariffCache? = null,
     ): StationDetail? = withContext(Dispatchers.Main.immediate) {
         runMutex.withLock {
             stopRequested = false
             running = true
             val startedAt = System.currentTimeMillis()
             try {
-                val detail = collectDetailWithRecovery(stationName, address)
+                val detail = collectDetailWithRecovery(stationName, address, dailyTariff)
                 if (detail != null) {
                     saveDetail(stationName, address, latitude, longitude, stationId, remoteTaskId, detail)
                     emit(CollectionState.DONE, "已采集 ${detail.stationName}", 1, detail.stationName)
-                    pauseUntil = System.currentTimeMillis() + Random.nextLong(4_000L, 9_000L)
+                    pauseUntil = System.currentTimeMillis() + Random.nextLong(4_000L, 9_000L) + uiPacing.extraDelayMs()
                 }
                 detail
             } catch (error: Throwable) {
@@ -253,18 +276,63 @@ class CollectionEngine(
             text.contains("微信") && text.contains("反馈")
     }
 
-    private fun collectionSnapshot(service: ChargingAccessibilityService): NodeSnapshot? {
-        val snapshot = service.freshSnapshot() ?: return null
+    private var lastPromotionImageProbeAt = -5_000L
+
+    /** Clear a supported promotion before any search match or data parsing. */
+    private suspend fun collectionSnapshot(
+        service: ChargingAccessibilityService,
+        forcePromotionImage: Boolean = false,
+    ): NodeSnapshot? {
+        checkStop()
+        var snapshot = service.freshSnapshot() ?: return null
         if (isBaiduFeedbackPage(snapshot)) throw BaiduFeedbackPageException()
-        return snapshot
+        val now = SystemClock.uptimeMillis()
+        val inspectImage = forcePromotionImage || now - lastPromotionImageProbeAt >= 5_000L
+        if (inspectImage) lastPromotionImageProbeAt = now
+        var target = service.observeBaiduPromotion(snapshot, inspectImage).target ?: return snapshot
+        repeat(2) { attempt ->
+            checkStop()
+            AppPreferences.appendLog(context,
+                "检测到百度充电券广告：${target.evidence}；点击关闭（${attempt + 1}/2），位置=${target.bounds}")
+            if (!service.clickAt(target.bounds.centerX, target.bounds.centerY)) {
+                throw IllegalStateException("百度广告关闭点击未执行，保留任务失败原因")
+            }
+            // Dispatch success is not proof the overlay disappeared. Do not also click its parent.
+            settleUi("关闭百度充电券广告", 900L)
+            checkStop()
+            snapshot = service.freshSnapshot()
+                ?: throw IllegalStateException("关闭百度广告后暂时无法读取页面")
+            if (isBaiduFeedbackPage(snapshot)) throw BaiduFeedbackPageException()
+            var observation = service.observeBaiduPromotion(snapshot, inspectImage = true)
+            lastPromotionImageProbeAt = SystemClock.uptimeMillis()
+            if (observation.target == null && target.visual && !observation.imageChecked) {
+                // A busy screenshot API cannot be mistaken for successful dismissal.
+                delay(500L)
+                checkStop()
+                snapshot = service.freshSnapshot()
+                    ?: throw IllegalStateException("关闭百度广告后无法确认当前页面")
+                observation = service.observeBaiduPromotion(snapshot, inspectImage = true)
+            }
+            val remaining = observation.target
+            if (remaining == null) {
+                if (target.visual && !observation.imageChecked) {
+                    throw IllegalStateException("百度广告已点击关闭，但图像暂不可用，尚未确认关闭")
+                }
+                AppPreferences.appendLog(context, "百度充电券广告已关闭，重新读取页面继续当前站点")
+                return snapshot
+            }
+            // Only repeat if a fresh observation still locates a close control.
+            target = remaining
+        }
+        throw IllegalStateException("百度充电券广告关闭两次后仍遮挡页面，本次不按无匹配跳过")
     }
 
-    private suspend fun collectDetailWithRecovery(stationName: String, address: String): StationDetail {
+    private suspend fun collectDetailWithRecovery(stationName: String, address: String, dailyTariff: DailyTariffCache? = null): StationDetail {
         var recoveries = 0
         while (true) {
             checkStop()
             try {
-                return collectDetail(stationName, address)
+                return collectDetail(stationName, address, dailyTariff)
             } catch (error: BaiduFeedbackPageException) {
                 if (recoveries >= 1) {
                     throw IllegalStateException("百度地图异常反馈页重开后再次出现，本任务停止自动恢复", error)
@@ -285,14 +353,15 @@ class CollectionEngine(
         if (!service.leaveBaiduForRecovery()) {
             throw IllegalStateException("百度异常反馈页退出失败")
         }
-        delay(800L)
+        settleUi("退出异常页面", 800L)
         checkStop()
         emit(CollectionState.OPENING_AMAP, "重新打开百度地图，恢复当前站点采集（1/1）", 0, stationName)
         if (!service.relaunchBaiduForRecovery(clearTask = true)) {
             throw IllegalStateException("百度异常反馈页退出后重新打开失败")
         }
+        settleUi("重新打开百度地图")
         val openedAt = SystemClock.uptimeMillis()
-        val deadline = openedAt + 12_000L
+        val deadline = openedAt + uiTimeout(12_000L)
         var stableReads = 0
         var reopenedOnce = false
         while (SystemClock.uptimeMillis() < deadline) {
@@ -310,6 +379,7 @@ class CollectionEngine(
                 if (!service.relaunchBaiduForRecovery(clearTask = false)) {
                     throw IllegalStateException("百度地图退回桌面后补开失败")
                 }
+                settleUi("再次唤起百度地图")
                 continue
             }
             if (hasMapWindow && snapshot != null && !isBaiduFeedbackPage(snapshot) && collectTexts(snapshot).isNotEmpty()) {
@@ -326,7 +396,7 @@ class CollectionEngine(
         throw IllegalStateException("百度地图重开后12秒内未恢复可读取的地图页面")
     }
 
-    private suspend fun collectDetail(stationName: String, address: String): StationDetail {
+    private suspend fun collectDetail(stationName: String, address: String, dailyTariff: DailyTariffCache? = null): StationDetail {
         emit(CollectionState.WAITING_SERVICE, "检查无障碍服务", 0, stationName)
         val service = waitForService() ?: throw IllegalStateException("无障碍服务未连接")
         ensureBaiduForeground(service)
@@ -356,7 +426,7 @@ class CollectionEngine(
             checkStop()
             emit(CollectionState.READING_DETAIL, "滚动查找电价和桩信息（${scrollCount + 1}/$MAX_DETAIL_SCROLLS）", 0, stationName)
             service.scrollContentSlow()
-            delay(1_200L)
+            settleUi("详情页滑动后等待内容加载", 1_200L)
             loadedSnapshot = collectionSnapshot(service) ?: loadedSnapshot
             hasData = hasPriceOrPile(loadedSnapshot)
             scrollCount++
@@ -370,34 +440,44 @@ class CollectionEngine(
             parseDetail(loadedSnapshot, stationName, address),
         )
 
-        // 5. 日常循环只读取卡片状态；已有静态逐桩明细由服务端保留。
-        detail = collectChargingStatusIfPresent(service, detail)
+        // 5. 仅在站点详情首页读取电桩卡片，不进入逐桩详情。
+        detail = collectPileCardSummaries(service, detail)
         var resultPeriods: List<PricePeriod> = emptyList()
+        var priceReadAt = 0L
 
-        // 6. 从当前详情页位置继续向下找分时电价，检查每次滚动后的页面。
-        emit(CollectionState.OPENING_PRICE, "查找分时电价入口", 0, stationName)
-        val priceLookup = openPriceSheet(service, stationName, detail)
-        detail = priceLookup.detail
-        if (priceLookup.opened) {
-            val sheet = waitForPriceSheet(service, stationName, priceLookup.sheetAlreadyVisible)
-            if (sheet != null) {
-                emit(CollectionState.READING_PRICE, "读取分时电价", 0, stationName)
-                val periods = BaiduPriceParser.periods(sheet)
-                if (periods.isNotEmpty()) {
-                    resultPeriods = periods
+        val reused = DailyTariffPolicy.reuse(detail, dailyTariff, "BAIDU")
+        if (reused != null) {
+            detail = reused
+            emit(CollectionState.READING_PRICE, "当前价核对一致，沿用今日分时方案，仅更新桩状态", 0, stationName)
+            AppPreferences.appendLog(context, "分时价格沿用今日方案，原采集时间=${reused.priceScheduleCapturedAt}: $stationName")
+        } else {
+            // 6. 从当前详情页位置继续向下找分时电价，检查每次滚动后的页面。
+            emit(CollectionState.OPENING_PRICE, "查找分时电价入口", 0, stationName)
+            val priceLookup = openPriceSheet(service, stationName, detail)
+            detail = priceLookup.detail
+            if (priceLookup.opened) {
+                val sheet = waitForPriceSheet(service, stationName, priceLookup.sheetAlreadyVisible)
+                if (sheet != null) {
+                    emit(CollectionState.READING_PRICE, "读取分时电价", 0, stationName)
+                    val periods = BaiduPriceParser.periods(sheet)
+                    if (periods.isNotEmpty()) {
+                        resultPeriods = periods
+                        priceReadAt = System.currentTimeMillis()
+                    }
                 }
             }
+
         }
 
         // 7. 返回搜索页
         emit(CollectionState.RETURNING, "返回搜索页", 1, stationName)
         returnToSearchPage(service)
         return if (resultPeriods.isEmpty()) detail
-        else detail.copy(fastPrices = resultPeriods, priceTrendTitle = "价格详情")
+        else detail.copy(fastPrices = resultPeriods, priceTrendTitle = "价格详情", priceScheduleCapturedAt = priceReadAt, priceScheduleReused = false)
     }
 
     private suspend fun waitForService(timeoutMs: Long = 15_000L): ChargingAccessibilityService? {
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = System.currentTimeMillis() + uiTimeout(timeoutMs)
         while (System.currentTimeMillis() < deadline) {
             checkStop()
             ChargingAccessibilityService.current()?.let { return it }
@@ -409,14 +489,15 @@ class CollectionEngine(
     private suspend fun ensureBaiduForeground(service: ChargingAccessibilityService) {
         if (service.isAmapForeground()) {
             recoverBaiduIfNeeded(service)
+            settleUi("读取百度地图页面")
             return
         }
         emit(CollectionState.OPENING_AMAP, "正在打开百度地图")
         service.launchAmap()
-        delay(1_500L)
+        settleUi("打开百度地图", 1_500L)
         if (!service.isAmapForeground()) {
             service.launchAmap()
-            delay(2_000L)
+            settleUi("再次打开百度地图", 2_000L)
         }
         recoverBaiduIfNeeded(service)
     }
@@ -441,7 +522,7 @@ class CollectionEngine(
     }
 
     private suspend fun recoverBaiduIfNeeded(service: ChargingAccessibilityService): Boolean {
-        val initial = collectionSnapshot(service) ?: return false
+        val initial = collectionSnapshot(service, forcePromotionImage = true) ?: return false
         var confirm = baiduRecoveryConfirm(initial) ?: return false
         checkStop()
         emit(CollectionState.OPENING_AMAP, "检测到百度地图异常恢复页，点击确认")
@@ -449,7 +530,8 @@ class CollectionEngine(
             throw IllegalStateException("百度地图异常恢复页确认点击失败")
         }
         val startedAt = SystemClock.uptimeMillis()
-        val deadline = startedAt + 10_000L
+        settleUi("确认异常恢复页")
+        val deadline = SystemClock.uptimeMillis() + uiTimeout(10_000L)
         var confirmClicks = 1
         var lastLaunchAt = startedAt
         while (SystemClock.uptimeMillis() < deadline) {
@@ -461,7 +543,8 @@ class CollectionEngine(
                 if (now - lastLaunchAt >= 1_000L) {
                     emit(CollectionState.OPENING_AMAP, "异常页已确认，正在重新打开百度地图")
                     service.launchAmap()
-                    lastLaunchAt = now
+                    settleUi("异常恢复后打开百度地图")
+                    lastLaunchAt = SystemClock.uptimeMillis()
                 }
                 continue
             }
@@ -478,6 +561,7 @@ class CollectionEngine(
                 if (!service.clickAt(confirm.bounds.centerX, confirm.bounds.centerY)) {
                     throw IllegalStateException("百度地图异常恢复页再次确认失败")
                 }
+                settleUi("再次确认异常恢复页")
                 confirmClicks++
             }
         }
@@ -505,7 +589,10 @@ class CollectionEngine(
                     failure = "搜索框不可编辑"
                 } else {
                     emit(CollectionState.SCANNING_RESULTS, "搜索框可编辑，确认输入焦点", 0, stationName)
-                    if (!editable.focused) service.focusSearchInput()
+                    if (!editable.focused) {
+                        service.focusSearchInput()
+                        settleUi("搜索框获取焦点")
+                    }
                     val focused = waitForSearchInput(service, 2_000L) { it.ready && it.focused }
                     if (focused == null) {
                         failure = "搜索框未获得焦点"
@@ -513,6 +600,7 @@ class CollectionEngine(
                         emit(CollectionState.SCANNING_RESULTS, "写入站名并核对输入内容", 0, stationName)
                         val actionAccepted = service.setFocusedText(stationName)
                         AppPreferences.appendLog(context, "搜索词写入动作已提交=$actionAccepted，等待回读核对")
+                        settleUi("写入搜索站名")
                         // Acceptance of ACTION_SET_TEXT is not proof of a successful write.
                         // Require two fresh, matching reads before the search button is clicked.
                         val verified = waitForSearchInput(service, 2_000L, consecutiveMatches = 2) {
@@ -584,12 +672,12 @@ class CollectionEngine(
         emit(CollectionState.SCANNING_RESULTS, "站名已更新，等待2秒刷新新的联想列表", 0, stationName)
         val startedAt = SystemClock.uptimeMillis()
         // 新词写入成功时，旧词的联想列表可能仍停留在页面上；刷新等待期间禁止匹配和点击。
-        delay(2_000L)
+        settleUi("刷新站名联想列表", 2_000L)
         checkStop()
         emit(CollectionState.SCANNING_RESULTS, "读取新的地点联想，优先查找匹配站点", 0, stationName)
         var previous: SuggestionMatch? = null
         var chosen: SuggestionMatch? = null
-        while (SystemClock.uptimeMillis() - startedAt < SUGGESTION_TIMEOUT_MS) {
+        while (SystemClock.uptimeMillis() - startedAt < uiTimeout(SUGGESTION_TIMEOUT_MS)) {
             checkStop()
             val input = service.searchInputState()
             if (input == null || !input.ready || input.text != stationName) {
@@ -611,7 +699,7 @@ class CollectionEngine(
             return null
         }
         checkStop()
-        val current = collectionSnapshot(service)?.let { suggestionMatches(it, stationName, service.searchSuggestionVisibleBottom()).firstOrNull() }
+        val current = collectionSnapshot(service, forcePromotionImage = true)?.let { suggestionMatches(it, stationName, service.searchSuggestionVisibleBottom()).firstOrNull() }
         val input = service.searchInputState()
         if (input?.let { it.ready && it.text == stationName } != true || current == null ||
             current.label != chosen.label || !sameResultPosition(chosen.point, current.point)
@@ -626,8 +714,9 @@ class CollectionEngine(
             return null
         }
         emit(CollectionState.OPENING_DETAIL, "已点击联想站名，等待列表或目标详情", 0, stationName)
+        settleUi("点击匹配联想结果")
         val clickedAt = SystemClock.uptimeMillis()
-        while (SystemClock.uptimeMillis() - clickedAt < SEARCH_LOADING_TIMEOUT_MS) {
+        while (SystemClock.uptimeMillis() - clickedAt < uiTimeout(SEARCH_LOADING_TIMEOUT_MS)) {
             checkStop()
             val snapshot = collectionSnapshot(service)
             val onInput = service.searchInputState() != null
@@ -656,7 +745,7 @@ class CollectionEngine(
         consecutiveMatches: Int = 1,
         predicate: (ChargingAccessibilityService.SearchInputState) -> Boolean,
     ): ChargingAccessibilityService.SearchInputState? {
-        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        val deadline = SystemClock.uptimeMillis() + uiTimeout(timeoutMs)
         var matches = 0
         while (SystemClock.uptimeMillis() < deadline) {
             checkStop()
@@ -689,7 +778,7 @@ class CollectionEngine(
             val onPileSheet = texts.any { it.trim() == "电桩详情" }
             if (onPriceSheet || onPileSheet || onDetail) {
                 service.globalBack()
-                delay(700L)
+                settleUi("返回搜索输入页", 700L)
                 return@repeat
             }
             // Both the results page and the home page have a top search bar.
@@ -697,12 +786,14 @@ class CollectionEngine(
             emit(CollectionState.SCANNING_RESULTS, "点击顶部搜索输入框", 0)
             val clicked = service.clickTopSearchBar()
             AppPreferences.appendLog(context, "打开搜索输入页：顶部输入框点击已提交=$clicked")
+            settleUi("打开搜索输入框")
             if (waitForSearchInput(service, 1_600L) { true } != null) return true
             // Retry the physical input area on result pages too; waiting alone
             // cannot open a bar whose accessibility node is not clickable.
             emit(CollectionState.SCANNING_RESULTS, "输入页未打开，再点一次顶部输入框", 0)
             val fallbackClicked = service.clickTopSearchBar(forceCoordinate = true)
             AppPreferences.appendLog(context, "打开搜索输入页：坐标补点已提交=$fallbackClicked")
+            settleUi("补点搜索输入框")
             if (waitForSearchInput(service, 1_200L) { true } != null) return true
         }
         return service.searchInputState() != null
@@ -742,7 +833,10 @@ class CollectionEngine(
         stationName: String,
         destination: SearchDestination,
     ): NodeSnapshot? = when (destination) {
-        is SearchDestination.DirectDetail -> destination.snapshot
+        is SearchDestination.DirectDetail -> {
+            settleUi("直接打开站点详情")
+            collectionSnapshot(service) ?: destination.snapshot
+        }
         is SearchDestination.ListResult -> {
             val point = destination.point
             AppPreferences.appendLog(context, "命中结果 ${point.first},${point.second}: $stationName")
@@ -808,7 +902,7 @@ class CollectionEngine(
         point: Pair<Int, Int>,
     ): NodeSnapshot? {
         checkStop()
-        val snapshot = collectionSnapshot(service)
+        val snapshot = collectionSnapshot(service, forcePromotionImage = true)
         if (snapshot != null && service.searchInputState() == null && directDetailTitle(snapshot, stationName) != null) {
             emit(CollectionState.OPENING_DETAIL, "目标详情已直接打开，继续读取", 0, stationName)
             return snapshot
@@ -826,7 +920,7 @@ class CollectionEngine(
         checkStop()
         if (!service.clickAt(confirmedPoint.first, confirmedPoint.second)) return null
         emit(CollectionState.OPENING_DETAIL, "已提交列表项点击，等待确认详情页打开", 0, stationName)
-        delay(Random.nextLong(1_200L, 1_800L))
+        settleUi("从结果列表进入详情页", Random.nextLong(1_200L, 1_800L))
         return waitForDetail(service, stationName, 8_000L)
     }
 
@@ -917,7 +1011,7 @@ class CollectionEngine(
             return initialSnapshot
         }
         emit(CollectionState.SCANNING_RESULTS, "当前结果无匹配，刷新并复核城市切换入口", 0, stationName)
-        val deadline = SystemClock.elapsedRealtime() + SEARCH_CITY_RECOVERY_TIMEOUT_MS
+        val deadline = SystemClock.elapsedRealtime() + uiTimeout(SEARCH_CITY_RECOVERY_TIMEOUT_MS)
         var snapshot = initialSnapshot
         var sawCityHint = expectCityOptions || initialOptions != null
         var previousFingerprint: String? = null
@@ -1019,7 +1113,7 @@ class CollectionEngine(
     ) {
         emit(CollectionState.SCANNING_RESULTS, "结果卡片文字未读全，刷新并小幅滚动后重新读取", 0, stationName)
         service.refreshSearchResultNodes()
-        delay(350L)
+        settleUi("刷新搜索结果文字", 350L)
         checkStop()
         val refreshed = collectionSnapshot(service) ?: return
         if (isSearchLoading(refreshed) || unreadableSearchCards(refreshed).isEmpty()) return
@@ -1034,12 +1128,12 @@ class CollectionEngine(
         val startY = (top + bottom) / 2 + 70
         val endY = startY - 140
         service.swipe(x, startY, x, endY, 450L)
-        delay(650L)
+        settleUi("搜索列表小幅滑动", 650L)
         checkStop()
         val afterScroll = collectionSnapshot(service) ?: return
         if (isSearchLoading(afterScroll) || searchResultList(afterScroll) == null) return
         service.swipe(x, endY, x, startY, 450L)
-        delay(650L)
+        settleUi("搜索列表小幅滑动", 650L)
         checkStop()
         service.refreshSearchResultNodes()
     }
@@ -1062,11 +1156,11 @@ class CollectionEngine(
             checkStop()
             val action = if (attempt == 1) "点搜索并查找结果" else "再次点击搜索，等待新结果"
             emit(CollectionState.SCANNING_RESULTS,
-                "$action（第${attempt}/2次，查找上限${SEARCH_RESULT_TIMEOUT_MS / 1_000}秒）", 0, stationName)
+                "$action（第${attempt}/2次，查找上限${uiTimeout(SEARCH_RESULT_TIMEOUT_MS) / 1_000}秒）", 0, stationName)
             if (!service.clickSearchSubmitButton()) {
                 throw IllegalStateException("第${attempt}次搜索按钮点击失败: $stationName")
             }
-            delay(Random.nextLong(2_200L, 3_200L))
+            settleUi("提交站点搜索", Random.nextLong(2_200L, 3_200L))
             val destination = findResultAcrossCities(service, stationName)
             if (destination != null) return destination
         }
@@ -1179,7 +1273,7 @@ class CollectionEngine(
     ): NodeSnapshot? {
         checkStop()
         check(isHenanSearchLocation(city)) { "禁止切换至河南省外或未确认归属的地点: $city" }
-        val before = collectionSnapshot(service)
+        val before = collectionSnapshot(service, forcePromotionImage = true)
             ?: throw IllegalStateException("切换城市前无法读取搜索页: $city")
         if (isSearchLoading(before)) throw IllegalStateException("搜索仍在加载，暂不能切换至$city")
         val target = searchCityOptions(before)?.cities?.firstOrNull { it.name == city }
@@ -1189,7 +1283,8 @@ class CollectionEngine(
             throw IllegalStateException("城市入口点击失败: $city")
         }
         emit(CollectionState.SCANNING_RESULTS, "已点击$city，等待检索结束及新结果出现", 0, stationName)
-        val deadline = SystemClock.elapsedRealtime() + SEARCH_LOADING_TIMEOUT_MS
+        settleUi("切换城市至$city")
+        val deadline = SystemClock.elapsedRealtime() + uiTimeout(SEARCH_LOADING_TIMEOUT_MS)
         var previousFingerprint: String? = null
         var reportedLoading = false
         var previousDetailTitle: Pair<String, Rect>? = null
@@ -1245,7 +1340,7 @@ class CollectionEngine(
         prioritizeNamedCity: Boolean = false,
     ): SearchDestination? {
         val startedAt = SystemClock.elapsedRealtime()
-        val hardDeadline = startedAt + SEARCH_LOADING_TIMEOUT_MS + SEARCH_RESULT_TIMEOUT_MS
+        val hardDeadline = startedAt + uiTimeout(SEARCH_LOADING_TIMEOUT_MS) + uiTimeout(SEARCH_RESULT_TIMEOUT_MS)
         var resultDeadline: Long? = null
         var loadingStartedAt: Long? = startedAt
         var previousPoint: Pair<Int, Int>? = null
@@ -1293,7 +1388,7 @@ class CollectionEngine(
                 }
                 loadingStartedAt = null
                 reportedLoading = false
-                val deadline = resultDeadline ?: (now + SEARCH_RESULT_TIMEOUT_MS).also { resultDeadline = it }
+                val deadline = resultDeadline ?: (now + uiTimeout(SEARCH_RESULT_TIMEOUT_MS)).also { resultDeadline = it }
                 val point = findResultPoint(snapshot, stationName)
                 if (point != null) sawTarget = true
                 val previous = previousPoint
@@ -1335,7 +1430,7 @@ class CollectionEngine(
                     emit(CollectionState.SCANNING_RESULTS, "正在检索或页面尚未确认，等待列表或目标详情", 0, stationName)
                     reportedLoading = true
                 }
-                if (now - loadingSince >= SEARCH_LOADING_TIMEOUT_MS) break
+                if (now - loadingSince >= uiTimeout(SEARCH_LOADING_TIMEOUT_MS)) break
             }
             delay(350L)
         }
@@ -1427,7 +1522,7 @@ class CollectionEngine(
         stationName: String,
         timeoutMs: Long = 12_000L,
     ): NodeSnapshot? {
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = System.currentTimeMillis() + uiTimeout(timeoutMs)
         while (System.currentTimeMillis() < deadline) {
             checkStop()
             val snapshot = collectionSnapshot(service)
@@ -1886,43 +1981,36 @@ class CollectionEngine(
         slowPower = incoming.slowPower.ifBlank { existing.slowPower },
     )
 
-    private suspend fun collectChargingStatusIfPresent(
+    private suspend fun collectPileCardSummaries(
         service: ChargingAccessibilityService,
         initialDetail: StationDetail,
     ): StationDetail {
         var detail = initialDetail
         var previousSignature = ""
         var unchanged = 0
-        emit(CollectionState.READING_DETAIL, "读取电桩空闲/忙碌状态", 0, detail.stationName)
         for (attempt in 0..MAX_DETAIL_SCROLLS) {
             checkStop()
             val snapshot = collectionSnapshot(service) ?: throw IllegalStateException("读取站点详情失败")
             detail = mergeStationDetail(detail, parseDetail(snapshot, detail.stationName, detail.address))
             val cards = BaiduChargingPileParser.cards(snapshot)
             if (cards.isNotEmpty()) {
-                val summary = cards.joinToString("；") { card ->
-                    val total = card.total.toIntOrNull()
-                    val idle = card.available.toIntOrNull()
-                    if (total != null && idle != null && idle in 0..total) {
-                        "${card.type}空闲$idle/忙碌${total - idle}/共$total"
-                    } else {
-                        "${card.type}共${card.total}，空闲/忙碌未知"
-                    }
+                val summary = cards.joinToString("，") { card ->
+                    "${card.type}空闲${card.available.ifBlank { "未知" }}/${card.total}"
                 }
-                emit(CollectionState.READING_DETAIL, "已读取：$summary，继续查找分时电价", 0, detail.stationName)
+                emit(CollectionState.READING_DETAIL, "已读取首页电桩卡片：$summary", 0, detail.stationName)
                 return detail
             }
-            // Price follows the pile cards. Keep its entry visible for price-only stations.
+            // The price entry follows the cards; keep it visible for the price collection step.
             if (visiblePriceEntry(service, snapshot) != null) break
             val signature = collectTextNodes(snapshot).joinToString("|") { "${it.first}@${it.second.top}" }
             unchanged = if (signature.isNotBlank() && signature == previousSignature) unchanged + 1 else 0
             if (unchanged >= 2 || attempt == MAX_DETAIL_SCROLLS) break
             previousSignature = signature
-            emit(CollectionState.READING_DETAIL, "滚动查找电桩状态卡片（${attempt + 1}/$MAX_DETAIL_SCROLLS）", 0, detail.stationName)
-            service.scrollContentSlow()
-            delay(1_100L)
+            emit(CollectionState.READING_DETAIL, "滚动查找首页电桩卡片（${attempt + 1}/$MAX_DETAIL_SCROLLS）", 0, detail.stationName)
+            if (!service.scrollContentSlow()) break
+            settleUi("滑动后读取首页电桩卡片", 1_100L)
         }
-        emit(CollectionState.READING_DETAIL, "未找到电桩状态卡片，继续查找分时电价", 0, detail.stationName)
+        emit(CollectionState.READING_DETAIL, "首页未找到电桩状态卡片，继续处理分时电价", 0, detail.stationName)
         return detail
     }
 
@@ -1953,7 +2041,7 @@ class CollectionEngine(
         // 检查当前位置，以及每次向下滚动后的页面，包括最后一次滚动后。
         for (scrollCount in 0..maxScrolls) {
             checkStop()
-            val snapshot = collectionSnapshot(service)
+            val snapshot = collectionSnapshot(service, forcePromotionImage = true)
                 ?: throw IllegalStateException("读取站点详情失败，无法查找分时电价")
             if (BaiduPriceParser.findSheet(snapshot) != null) {
                 emit(CollectionState.READING_PRICE, "价格弹层已打开，读取价格内容", 0, stationName)
@@ -1969,7 +2057,7 @@ class CollectionEngine(
                     throw IllegalStateException("点击查看价格详情失败")
                 }
                 emit(CollectionState.OPENING_PRICE, "已点击查看价格详情，等待价格弹层", 0, stationName)
-                delay(1_200L)
+                settleUi("打开分时电价弹窗", 1_200L)
                 return PriceSheetLookup(detail, opened = true)
             }
             if (scrollCount == maxScrolls) break
@@ -1979,7 +2067,7 @@ class CollectionEngine(
                 if (detail.currentPrice.isNotBlank()) break
                 throw IllegalStateException("向下查找分时电价时滑动失败")
             }
-            delay(1_200L)
+            settleUi("详情页滑动后等待内容加载", 1_200L)
         }
         val message = if (detail.currentPrice.isNotBlank()) {
             "未找到价格详情入口，已读取页面电价 ¥${detail.currentPrice}/度"
@@ -1996,7 +2084,7 @@ class CollectionEngine(
         sheetAlreadyVisible: Boolean,
     ): NodeSnapshot? {
         val startedAt = System.currentTimeMillis()
-        val deadline = startedAt + 15_000L
+        val deadline = startedAt + uiTimeout(15_000L)
         var retryClicks = 0
         var sheetObserved = sheetAlreadyVisible
         fun readySheet(snapshot: NodeSnapshot?): NodeSnapshot? {
@@ -2018,7 +2106,7 @@ class CollectionEngine(
             if (!sheetObserved && elapsed > 3_000L && retryClicks < 2) {
                 // 补点前再取一次快照；一旦见过弹层标题，本次等待中都禁止补点背景。
                 checkStop()
-                val retrySnapshot = collectionSnapshot(service)
+                val retrySnapshot = collectionSnapshot(service, forcePromotionImage = true)
                 readySheet(retrySnapshot)?.let { return it }
                 if (!sheetObserved && retrySnapshot != null) {
                     val entry = visiblePriceEntry(service, retrySnapshot)
@@ -2029,7 +2117,7 @@ class CollectionEngine(
                         val message = if (clicked) "尚未识别到价格弹层，补点第 $retryClicks 次"
                             else "价格详情补点第 $retryClicks 次失败，继续等待"
                         emit(CollectionState.OPENING_PRICE, message, 0, stationName)
-                        delay(1_000L)
+                        settleUi("补点分时电价入口", 1_000L)
                     }
                 }
             }
@@ -2044,7 +2132,7 @@ class CollectionEngine(
     private suspend fun returnToSearchPage(service: ChargingAccessibilityService) {
         repeat(3) {
             service.globalBack()
-            delay(900L)
+            settleUi("返回搜索页", 900L)
             if (service.searchInputState() != null) return
         }
     }
@@ -2092,10 +2180,16 @@ class CollectionEngine(
             "slowAvailable" to detail.slowAvailable,
             "slowTotal" to detail.slowTotal,
             "slowPower" to detail.slowPower,
+            "priceScheduleCapturedAt" to (detail.priceScheduleCapturedAt.takeIf { it > 0 } ?: if (detail.fastPrices.isNotEmpty() || detail.slowPrices.isNotEmpty()) System.currentTimeMillis() else 0L),
+            "priceScheduleMode" to if (detail.priceScheduleReused) "REUSED" else "COLLECTED",
+            "priceSchedulePlatform" to "BAIDU",
             "priceTrendTitle" to detail.priceTrendTitle,
             "fastPrices" to detail.fastPrices,
             "slowPrices" to detail.slowPrices,
-            // Only live card aggregates are refreshed; static pile rows stay on the server.
+            "chargingPileCount" to detail.chargingPiles.size,
+            "chargingPileTotal" to detail.chargingPileTotal,
+            "chargingPiles" to detail.chargingPiles,
+            // 本轮实时空闲数和总数来自详情首页卡片。
             "pileStatusSource" to "DETAIL_CARD",
             "latitude" to latitude,
             "longitude" to longitude,

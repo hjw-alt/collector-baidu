@@ -12,4 +12,6 @@ data class NodeSnapshot(
     val selected: Boolean = false,
     val focused: Boolean = false,
     val children: List<NodeSnapshot> = emptyList(),
+    val visibleToUser: Boolean = true,
+    val password: Boolean = false,
 )

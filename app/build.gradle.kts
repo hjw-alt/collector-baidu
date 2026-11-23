@@ -12,8 +12,8 @@ android {
         applicationId = "com.tigercode.bdcollector"
         minSdk = 26
         targetSdk = 35
-        versionCode = 62
-        versionName = "0.1.61"
+        versionCode = 72
+        versionName = "0.1.71"
     }
 
     buildTypes {
@@ -34,11 +34,15 @@ android {
     buildFeatures {
         buildConfig = true
         viewBinding = true
+        aidl = true
     }
 }
 
 dependencies {
     implementation(project(":core"))
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+    testImplementation("junit:junit:4.13.2")
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")

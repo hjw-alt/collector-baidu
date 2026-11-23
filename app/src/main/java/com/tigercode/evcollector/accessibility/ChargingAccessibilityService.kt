@@ -2,6 +2,7 @@ package com.tigercode.evcollector.accessibility
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.KeyguardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -14,6 +15,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.util.Log
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Display
@@ -34,6 +36,9 @@ import com.tigercode.evcollector.core.model.PageKind
 import com.tigercode.evcollector.core.model.Rect as SnapshotRect
 import com.tigercode.evcollector.core.model.StationCandidate
 import com.tigercode.evcollector.core.parser.PageAssessor
+import com.tigercode.evcollector.recovery.AiRecoveryScene
+import com.tigercode.evcollector.recovery.BaiduAiRecoveryPolicy
+import com.tigercode.evcollector.recovery.RecoveryAction
 
 class ChargingAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -139,6 +144,108 @@ class ChargingAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** AI has no permission to use the regular MIUI window fallback. */
+    private fun <T> withAiRecoveryRoot(block: (AccessibilityNodeInfo) -> T?): T? {
+        if (getSystemService(PowerManager::class.java)?.isInteractive != true ||
+            getSystemService(KeyguardManager::class.java)?.isKeyguardLocked != false) return null
+        val currentWindows = windows
+        return try {
+            val root = rootInActiveWindow ?: return null
+            try {
+                if (root.packageName?.toString() != AMAP_PACKAGE) return null
+                val active = currentWindows.singleOrNull { it.id == root.windowId && it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+                    ?: return null
+                val obscured = currentWindows.any { window ->
+                    window.id != root.windowId && (window.isActive || window.isFocused ||
+                        (window.layer > active.layer && (window.type != AccessibilityWindowInfo.TYPE_SYSTEM ||
+                            Rect().also(window::getBoundsInScreen).height() > screenHeightPx() / 5)))
+                }
+                if (obscured || !active.isActive) return null
+                block(root)
+            } finally {
+                root.recycle()
+            }
+        } finally {
+            currentWindows.forEach { it.recycle() }
+        }
+    }
+
+    internal fun readAiRecoveryScene(): AiRecoveryScene? = withAiRecoveryRoot { root ->
+        AiRecoveryScene(root.windowId, NodeSnapshotReader.toSnapshot(root))
+    }
+
+    internal fun applyAiRecoveryAction(
+        expected: AiRecoveryScene,
+        action: RecoveryAction,
+        nodeId: String?,
+        canOperate: () -> Boolean,
+    ): Boolean =
+        withAiRecoveryRoot { root ->
+            val snapshot = NodeSnapshotReader.toSnapshot(root)
+            val fresh = AiRecoveryScene(root.windowId, snapshot)
+            if (expected != fresh || BaiduAiRecoveryPolicy.isProtected(snapshot) ||
+                BaiduAiRecoveryPolicy.isHome(snapshot) || !canOperate()) return@withAiRecoveryRoot false
+            when (action) {
+                RecoveryAction.BACK -> performGlobalAction(GLOBAL_ACTION_BACK)
+                RecoveryAction.CLOSE_OVERLAY -> BaiduAiRecoveryPolicy.closeTarget(snapshot)
+                    ?.let { target -> clickAiCloseNode(root, expected, target, canOperate) } ?: false
+                RecoveryAction.CLICK_NODE -> BaiduAiRecoveryPolicy.clickNodeTarget(expected, fresh, nodeId)
+                    ?.let { target -> clickAiCloseNode(root, expected, target, canOperate) } ?: false
+            }
+        } ?: false
+
+    private fun clickAiCloseNode(
+        root: AccessibilityNodeInfo,
+        expected: AiRecoveryScene,
+        target: NodeSnapshot,
+        canOperate: () -> Boolean,
+    ): Boolean {
+        val windowId = root.windowId
+        fun matches(node: AccessibilityNodeInfo): Boolean {
+            val b = Rect().also(node::getBoundsInScreen)
+            return node.windowId == windowId && node.packageName?.toString() == AMAP_PACKAGE &&
+                node.isVisibleToUser && node.isEnabled && node.isClickable &&
+                !node.isPassword && !node.isEditable && !node.isCheckable &&
+                target.bounds == SnapshotRect(b.left, b.top, b.right, b.bottom) &&
+                node.className?.toString().orEmpty() == target.className &&
+                node.text?.toString().orEmpty().trim() == target.text &&
+                node.contentDescription?.toString().orEmpty().trim() == target.contentDescription &&
+                node.viewIdResourceName.orEmpty() == target.viewId
+        }
+
+        var match: AccessibilityNodeInfo? = null
+        fun findUnique(node: AccessibilityNodeInfo): Boolean {
+            if (node.packageName?.toString() != AMAP_PACKAGE || node.isPassword) return true
+            if (matches(node)) {
+                if (match != null) return false
+                match = AccessibilityNodeInfo.obtain(node)
+            }
+            for (index in 0 until node.childCount) {
+                val child = node.getChild(index) ?: continue
+                try {
+                    if (!findUnique(child)) return false
+                } finally {
+                    child.recycle()
+                }
+            }
+            return true
+        }
+
+        return try {
+            if (!findUnique(root)) return false
+            val node = match ?: return false
+            withAiRecoveryRoot { active ->
+                // The same window ID can host a new dialog; verify its content as well as the live target.
+                active.windowId == windowId && NodeSnapshotReader.toSnapshot(active) == expected.snapshot &&
+                    node.refresh() && matches(node) && NodeSnapshotReader.toSnapshot(node) == target &&
+                    node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_CLICK } && canOperate() &&
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            } ?: false
+        } finally {
+            match?.recycle()
+        }
+    }
+
     /** 主动重取 WebView 子节点，修复检索结果行只暴露空容器的缓存。 */
     fun refreshSearchResultNodes() {
         val root = amapRoot() ?: return
@@ -167,10 +274,10 @@ class ChargingAccessibilityService : AccessibilityService() {
         snapshot: NodeSnapshot,
         inspectImage: Boolean,
     ): BaiduPromotionDetector.Observation {
-        BaiduPromotionDetector.fromNodes(snapshot, screenWidthPx(), screenHeightPx())?.let {
-            return BaiduPromotionDetector.Observation(it)
-        }
-        if (!inspectImage || Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isAmapWindowActive()) {
+        val nodes = BaiduPromotionDetector.observeNodes(snapshot, screenWidthPx(), screenHeightPx())
+        if (nodes.target != null || nodes.blockingImageCard) return nodes
+        if (BaiduPromotionDetector.isUpdateDialogVisible(snapshot) || isBaiduPlaceNameSheetVisible(snapshot) || !inspectImage ||
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isAmapWindowActive()) {
             return BaiduPromotionDetector.Observation(null)
         }
         val bitmap = captureBaiduScreen() ?: return BaiduPromotionDetector.Observation(null)
@@ -181,6 +288,93 @@ class ChargingAccessibilityService : AccessibilityService() {
         } finally {
             bitmap.recycle()
         }
+    }
+
+    internal fun isBaiduPlaceNameSheetVisible(snapshot: NodeSnapshot): Boolean =
+        BaiduPlaceNameSheetDetector.isVisible(snapshot, screenWidthPx(), screenHeightPx())
+
+    /** Only click the exact Cancel child of the freshly revalidated place-name sheet. */
+    private fun clickBaiduPlaceNameCancel(): Boolean {
+        val root = amapRoot() ?: return false
+        try {
+            val width = screenWidthPx()
+            val height = screenHeightPx()
+            val sheet = BaiduPlaceNameSheetDetector.cancelableSheet(NodeSnapshotReader.toSnapshot(root), width, height)
+                ?: return false
+            val panel = sheet.panel
+            val nodes = mutableListOf<AccessibilityNodeInfo>()
+            try {
+                // This MIUI WebView exposes Cancel through children but returns no
+                // results from findAccessibilityNodeInfosByText("取消").
+                fun collect(node: AccessibilityNodeInfo) {
+                    if (node.text?.toString()?.trim() == "取消" || node.contentDescription?.toString()?.trim() == "取消") {
+                        nodes.add(AccessibilityNodeInfo.obtain(node))
+                    }
+                    for (index in 0 until node.childCount) {
+                        val child = node.getChild(index) ?: continue
+                        try { collect(child) } finally { child.recycle() }
+                    }
+                }
+                collect(root)
+                val matches = nodes.filter { node ->
+                    if (node.packageName?.toString() != AMAP_PACKAGE || !node.isEnabled || !node.isClickable ||
+                        (node.text?.toString()?.trim() != "取消" && node.contentDescription?.toString()?.trim() != "取消")) {
+                        false
+                    } else {
+                        val parent = node.parent
+                        if (parent == null) false else try {
+                            val livePanel = NodeSnapshotReader.toSnapshot(parent)
+                            livePanel.bounds == panel.bounds && livePanel.children.firstOrNull()?.text == panel.children.first().text &&
+                                BaiduPlaceNameSheetDetector.cancelForPanel(livePanel, sheet.viewportWidth, sheet.viewportHeight) == NodeSnapshotReader.toSnapshot(node)
+                        } finally {
+                            parent.recycle()
+                        }
+                    }
+                }
+                val cancel = matches.singleOrNull() ?: run {
+                    Log.w("BaiduPopupClose", "地点名称菜单：取消候选=${nodes.size}，安全匹配=${matches.size}，未点击")
+                    return false
+                }
+                val accepted = cancel.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                Log.i("BaiduPopupClose", "地点名称菜单：取消 ACTION_CLICK accepted=$accepted")
+                return accepted
+            } finally {
+                nodes.forEach { it.recycle() }
+            }
+        } finally {
+            root.recycle()
+        }
+    }
+
+    /** The collector and local debug verification use the same single-close action. */
+    internal suspend fun closeBaiduPromotionOnce(
+        target: BaiduPromotionDetector.CloseTarget,
+        settle: suspend () -> Unit,
+    ): NodeSnapshot {
+        val current = freshSnapshot() ?: throw IllegalStateException("关闭百度弹窗前无法读取页面")
+        val liveTarget = observeBaiduPromotion(current, inspectImage = target.visual).target
+        if (target.action == BaiduPromotionDetector.CloseAction.CLOSE_IMAGE_CARD && liveTarget != target) return current
+        if (liveTarget == null) {
+            if (BaiduPromotionDetector.isUpdateDialogVisible(current)) {
+                throw IllegalStateException("百度版本更新弹窗仍在，但关闭按钮不可用")
+            }
+            if (isBaiduPlaceNameSheetVisible(current)) {
+                throw IllegalStateException("地点名称菜单仍在，但取消按钮不可用，停止操作背景页面")
+            }
+            if (target.visual) throw IllegalStateException("暂时无法重新定位百度广告关闭按钮")
+            return current
+        }
+        Log.i("BaiduPopupClose", "关闭目标=${liveTarget.evidence} bounds=${liveTarget.bounds}")
+        val clicked = when (liveTarget.action) {
+            BaiduPromotionDetector.CloseAction.CANCEL_PLACE_NAME -> clickBaiduPlaceNameCancel()
+            BaiduPromotionDetector.CloseAction.TAP_BOUNDS, BaiduPromotionDetector.CloseAction.CLOSE_IMAGE_CARD -> liveTarget.bounds.isValid &&
+                clickAt(liveTarget.bounds.centerX, liveTarget.bounds.centerY)
+        }
+        if (!clicked) {
+            throw IllegalStateException("百度弹窗关闭点击未执行，保留任务失败原因")
+        }
+        settle()
+        return freshSnapshot() ?: throw IllegalStateException("关闭百度弹窗后暂时无法读取页面")
     }
 
     private suspend fun captureBaiduScreen(): Bitmap? {
@@ -457,52 +651,56 @@ class ChargingAccessibilityService : AccessibilityService() {
 
     fun clickTopSearchBar(forceCoordinate: Boolean = false): Boolean {
         val root = amapRoot() ?: return false
-        try {
-            fun visit(node: AccessibilityNodeInfo): Boolean {
-                val bounds = android.graphics.Rect()
-                node.getBoundsInScreen(bounds)
-                val width = bounds.width()
-                val isTopSearchContainer = node.isClickable &&
-                    bounds.top in 60..280 &&
-                    bounds.bottom <= 320 &&
-                    bounds.left <= 220 &&
-                    bounds.right >= resources.displayMetrics.widthPixels - 220 &&
-                    width >= resources.displayMetrics.widthPixels * 0.55
-                if (isTopSearchContainer) {
-                    val clickedByGesture = !bounds.isEmpty && clickAt(bounds.centerX(), bounds.centerY())
-                    val clickedByAction = !clickedByGesture && clickNodeOrAncestor(node)
-                    Log.i(
-                        "EvCollector",
-                        "顶部搜索框 bounds=${bounds.toShortString()} " +
-                            "坐标点击=$clickedByGesture actionClick=$clickedByAction",
-                    )
-                    return clickedByGesture || clickedByAction
-                }
-                for (index in 0 until node.childCount) {
-                    val child = node.getChild(index) ?: continue
-                    try {
-                        if (visit(child)) return true
-                    } finally {
-                        child.recycle()
-                    }
-                }
-                return false
-            }
-            if (!forceCoordinate && visit(root)) return true
-            // Baidu result pages can expose the search bar without a clickable
-            // node. Tap the same top text area a user taps, then let the engine
-            // verify that a real editable input appears before writing anything.
-            val x = (screenWidthPx() * 0.45f).toInt()
-            val y = (screenHeightPx() * 0.083f).toInt()
-            val clicked = clickAt(x, y)
-            Log.i(
-                "EvCollector",
-                "顶部搜索框坐标兜底 force=$forceCoordinate x=$x y=$y clicked=$clicked",
-            )
-            return clicked
+        return try {
+            clickTopSearchBar(root, forceCoordinate)
         } finally {
             root.recycle()
         }
+    }
+
+    private fun clickTopSearchBar(root: AccessibilityNodeInfo, forceCoordinate: Boolean): Boolean {
+        fun visit(node: AccessibilityNodeInfo): Boolean {
+            val bounds = android.graphics.Rect()
+            node.getBoundsInScreen(bounds)
+            val width = bounds.width()
+            val isTopSearchContainer = node.isClickable && node.isVisibleToUser && node.isEnabled &&
+                bounds.top in 60..280 &&
+                bounds.bottom <= 320 &&
+                bounds.left <= 220 &&
+                bounds.right >= resources.displayMetrics.widthPixels - 220 &&
+                width >= resources.displayMetrics.widthPixels * 0.55
+            if (isTopSearchContainer) {
+                val clickedByGesture = !bounds.isEmpty && clickAt(bounds.centerX(), bounds.centerY())
+                val clickedByAction = !clickedByGesture && clickNodeOrAncestor(node)
+                Log.i(
+                    "EvCollector",
+                    "顶部搜索框 bounds=${bounds.toShortString()} " +
+                        "坐标点击=$clickedByGesture actionClick=$clickedByAction",
+                )
+                return clickedByGesture || clickedByAction
+            }
+            for (index in 0 until node.childCount) {
+                val child = node.getChild(index) ?: continue
+                try {
+                    if (visit(child)) return true
+                } finally {
+                    child.recycle()
+                }
+            }
+            return false
+        }
+        if (!forceCoordinate && visit(root)) return true
+        // Baidu result pages can expose the search bar without a clickable
+        // node. Tap the same top text area a user taps, then let the engine
+        // verify that a real editable input appears before writing anything.
+        val x = (screenWidthPx() * 0.45f).toInt()
+        val y = (screenHeightPx() * 0.083f).toInt()
+        val clicked = clickAt(x, y)
+        Log.i(
+            "EvCollector",
+            "顶部搜索框坐标兜底 force=$forceCoordinate x=$x y=$y clicked=$clicked",
+        )
+        return clicked
     }
 
     fun clickNodeByText(text: String): Boolean {

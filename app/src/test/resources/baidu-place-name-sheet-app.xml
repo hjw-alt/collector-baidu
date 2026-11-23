@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='utf-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" bounds="[0,0][1080,2280]">
+    <node text="地点详情" content-desc="" class="android.widget.TextView" bounds="[118,113][338,172]" clickable="false" enabled="true" />
+    <node text="" content-desc="" class="android.view.View" bounds="[0,1872][1083,2283]" clickable="false" enabled="true">
+      <node text="特来电充电站(许昌长葛广和充电站)" content-desc="" class="android.view.View" bounds="[0,1872][1083,2007]" clickable="true" enabled="true" />
+      <node text="复制地点名称" content-desc="" class="android.view.View" bounds="[0,2004][1083,2145]" clickable="true" enabled="true" />
+      <node text="取消" content-desc="" class="android.view.View" bounds="[0,2142][1083,2283]" clickable="true" enabled="true" />
+    </node>
+  </node>
+</hierarchy>

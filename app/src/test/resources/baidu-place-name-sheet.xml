@@ -1,0 +1,13 @@
+<?xml version='1.0' encoding='utf-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" bounds="[0,0][1080,2068]">
+    <node text="地点详情" resource-id="com.baidu.BaiduMap:id/text" class="android.widget.TextView" bounds="[116,112][336,171]" />
+    <node class="android.webkit.WebView" bounds="[0,0][1080,2068]">
+      <node index="0" text="" resource-id="" class="android.view.View" package="com.baidu.BaiduMap" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,1872][1080,2068]">
+        <node index="0" text="特来电充电站(许昌长葛广和充电站)" resource-id="" class="android.view.View" package="com.baidu.BaiduMap" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,1872][1080,2007]" />
+        <node index="1" text="复制地点名称" resource-id="" class="android.view.View" package="com.baidu.BaiduMap" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,2004][1080,2068]" />
+        <node index="2" text="取消" resource-id="" class="android.view.View" package="com.baidu.BaiduMap" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][0,0]" />
+      </node>
+    </node>
+  </node>
+</hierarchy>

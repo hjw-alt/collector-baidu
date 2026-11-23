@@ -9,10 +9,16 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.InputType
+import android.view.View
+import android.view.WindowManager
+import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import com.tigercode.evcollector.privileged.ShizukuMapController
 import com.tigercode.evcollector.AppPreferences
 import com.tigercode.evcollector.CollectorKeepAliveService
 import com.tigercode.evcollector.accessibility.ChargingAccessibilityService
@@ -30,12 +36,16 @@ import com.tigercode.evcollector.network.FleetControlClient
 import com.tigercode.evcollector.network.FleetStopRequest
 import com.tigercode.evcollector.network.SyncManager
 import com.tigercode.evcollector.network.SyncOutcome
+import com.tigercode.evcollector.recovery.DeepSeekKeyStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
+    private lateinit var shizukuControls: ShizukuControls
     private lateinit var repository: CollectorRepository
     private lateinit var engine: CollectionEngine
 
@@ -93,6 +103,12 @@ class MainActivity : AppCompatActivity() {
         binding.saveConfigButton.setOnClickListener { saveConfig() }
         binding.openAccessibilityButton.setOnClickListener { openAccessibilitySettings() }
         binding.openAmapButton.setOnClickListener { openAmap() }
+        updateAiRecoveryButton()
+        binding.aiRecoverySettingsButton.setOnClickListener { openAiRecoverySettings() }
+        shizukuControls = ShizukuControls(
+            this, binding.shizukuStatusText, binding.shizukuAuthorizeButton,
+            binding.shizukuStopMapButton,
+        ) { AppPreferences.isScanning(this) || engine.isRunning() || fleetStartInProgress }
         binding.startCollectButton.setOnClickListener { startWithFleetPermission { startCollector() } }
         binding.stopCollectButton.setOnClickListener { stopCollector() }
         binding.stopAllDevicesButton.setOnClickListener { stopAllDevices() }
@@ -137,6 +153,64 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private fun updateAiRecoveryButton() {
+        binding.aiRecoverySettingsButton.text = if (DeepSeekKeyStore.isConfigured(this)) {
+            "DeepSeek 异常恢复：已配置"
+        } else {
+            "DeepSeek 异常恢复：关闭"
+        }
+    }
+
+    private fun openAiRecoverySettings() {
+        val keyInput = EditText(this).apply {
+            hint = "DeepSeek API Key"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            isSaveEnabled = false
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+        }
+        val container = FrameLayout(this).apply {
+            val margin = (24 * resources.displayMetrics.density).toInt()
+            setPadding(margin, 0, margin, 0)
+            addView(keyInput, FrameLayout.LayoutParams(-1, -2))
+        }
+        val builder = AlertDialog.Builder(this).setTitle("DeepSeek 异常恢复").setView(container)
+            .setNegativeButton("取消", null).setPositiveButton("保存并启用", null)
+        if (DeepSeekKeyStore.isConfigured(this)) builder.setNeutralButton("关闭并清除密钥", null)
+        val dialog = builder.create()
+        dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        dialog.show()
+        val save = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        val disable = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        val cancel = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        fun updateKey(remove: Boolean) {
+            val key = if (remove) "" else keyInput.text.toString().trim()
+            if (!remove && !DeepSeekKeyStore.isValidFormat(key)) {
+                keyInput.error = "API Key 格式不正确"
+                return
+            }
+            keyInput.text.clear()
+            save.isEnabled = false
+            disable?.isEnabled = false
+            cancel.isEnabled = false
+            dialog.setCancelable(false)
+            lifecycleScope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    if (remove) DeepSeekKeyStore.disable(applicationContext) else DeepSeekKeyStore.save(applicationContext, key)
+                }
+                updateAiRecoveryButton()
+                if (ok) dialog.dismiss() else {
+                    save.isEnabled = true
+                    disable?.isEnabled = true
+                    cancel.isEnabled = true
+                    dialog.setCancelable(true)
+                    Toast.makeText(this@MainActivity, "无法更新 DeepSeek 密钥", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        save.setOnClickListener { updateKey(remove = false) }
+        disable?.setOnClickListener { updateKey(remove = true) }
+    }
+
     private fun saveConfig(): Boolean {
         val serverUrl = binding.serverUrlInput.text?.toString()?.trim().orEmpty()
         val normalizedServerUrl = AppPreferences.normalizeServerUrl(serverUrl)
@@ -167,6 +241,10 @@ class MainActivity : AppCompatActivity() {
     private var fleetStartInProgress = false
 
     private fun startWithFleetPermission(action: () -> Unit) {
+        if (ShizukuMapController.isBusy) {
+            Toast.makeText(this, "正在关闭地图，请稍候再操作", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (fleetStartInProgress) return
         if (AppPreferences.isScanning(this) || engine.isRunning()) {
             Toast.makeText(this, "本机正在采集，请先停止后再开始", Toast.LENGTH_SHORT).show()
@@ -295,6 +373,10 @@ class MainActivity : AppCompatActivity() {
                         this@MainActivity,
                         "人机验证，任务已释放，返回列表继续: ${outcome.message}",
                     )
+                }
+                is SyncOutcome.RecoveryPaused -> {
+                    AppPreferences.setRemoteStatus(this@MainActivity, "DeepSeek 恢复未完成，采集已暂停", outcome.message)
+                    AppPreferences.appendLog(this@MainActivity, outcome.message)
                 }
                 is SyncOutcome.Failed -> {
                     AppPreferences.setRemoteStatus(
@@ -565,6 +647,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openAmap() {
+        val restPhase = AppPreferences.baiduWorkRestState(this)?.phase
+        if (AppPreferences.isScanning(this) && restPhase != null &&
+            restPhase != com.tigercode.evcollector.core.engine.BaiduRestPhase.COLLECTING) {
+            Toast.makeText(this, "自动休息中，将在休息结束后重新打开百度地图", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (ShizukuMapController.isBusy) {
+            Toast.makeText(this, "正在关闭地图，请稍候再操作", Toast.LENGTH_SHORT).show()
+            return
+        }
         val service = ChargingAccessibilityService.current()
         if (service != null) {
             service.launchAmap()
@@ -591,6 +683,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshUi() {
         if (!::binding.isInitialized) return
+        if (::shizukuControls.isInitialized) shizukuControls.refresh()
         val accessibilityConnected = ChargingAccessibilityService.isConnected()
         val accessibilityEnabled = ChargingAccessibilityService.isEnabled(this)
         val scanning = AppPreferences.isScanning(this)
@@ -609,6 +702,7 @@ class MainActivity : AppCompatActivity() {
             )
             append("\n设备调度: ")
             append(if (scanning) "运行中" else "已停止")
+            append("\n自动轮休: 采集2小时 / 休息5分钟")
             append("\n本机等待: ")
             append(if (AppPreferences.slowDeviceMode(this@MainActivity)) "慢速（每步额外2～5秒）" else "常规")
             append("\n采集模式: ")

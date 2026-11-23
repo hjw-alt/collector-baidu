@@ -15,7 +15,10 @@ import com.tigercode.evcollector.engine.HumanVerificationException
 import com.tigercode.evcollector.engine.SuggestionSearchNotStartedException
 import com.tigercode.evcollector.engine.StationNotFoundException
 import com.tigercode.evcollector.engine.SkippedStationException
+import com.tigercode.evcollector.recovery.BaiduAiRecoveryPausedException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.job
@@ -53,6 +56,7 @@ class SyncManager(
             var api: ServerApi? = null
             var leaseRenewJob: Job? = null
             var fleetWatchJob: Job? = null
+            var preserveLease = false
             val leaseLost = AtomicBoolean(false)
             try {
                 reportStatus("正在连接百度采集服务器")
@@ -120,7 +124,16 @@ class SyncManager(
                         }
                     }
                 }
-                val claim = activeApi.claimTask(ClaimTaskRequest(deviceCode, collectionMode))
+                // Do not lose the returned lease if the two-hour deadline cancels this coroutine.
+                val claim = withContext(NonCancellable) {
+                    controlApi.claimTask(ClaimTaskRequest(deviceCode, collectionMode)).also { response ->
+                        response.task?.let { task ->
+                            AppPreferences.saveActiveRemoteLease(context,
+                                RemoteTaskLease(task.id, task.leaseToken, deviceCode, collectionMode))
+                        }
+                    }
+                }
+                currentCoroutineContext().ensureActive()
                 if (claim.reason == "FLEET_STOPPED") {
                     engine.stop()
                     FleetControlClient.markStopped(context)
@@ -175,6 +188,7 @@ class SyncManager(
                             longitude = task.stationLongitude,
                             remoteTaskId = task.id,
                             dailyTariff = task.dailyTariff,
+                            canRecover = { !leaseLost.get() },
                         ) ?: throw IllegalStateException("未采集到目标站点: $requestedName")
                         listOf(detail)
                     } else if (
@@ -190,6 +204,7 @@ class SyncManager(
                             longitude = task.stationLongitude,
                             remoteTaskId = task.id,
                             dailyTariff = task.dailyTariff,
+                            canRecover = { !leaseLost.get() },
                         ) ?: throw IllegalStateException("未采集到目标站点: $requestedName")
                         listOf(detail)
                     } else {
@@ -334,6 +349,17 @@ class SyncManager(
                     reason = "NO_MATCH",
                     message = "搜索结果中没有对应站点",
                 )
+            } catch (error: BaiduAiRecoveryPausedException) {
+                preserveLease = true
+                AppPreferences.setScanning(context, false)
+                val released = TaskLeaseReleaseClient.releasePending(
+                    context,
+                    reasonCode = "AI_RECOVERY_PAUSED",
+                    reasonMessage = "DeepSeek 未能确认百度地图首页，暂停采集并归还当前任务",
+                )
+                val message = error.message.orEmpty() +
+                    if (released) "；当前任务已归还或原租约已结束" else "；任务释放尚未确认，下次启动先核对原租约"
+                SyncOutcome.RecoveryPaused(message)
             } catch (error: CancellationException) {
                 engine.stop()
                 throw error
@@ -358,6 +384,8 @@ class SyncManager(
                 SyncOutcome.Failed(friendlyNetworkError(error))
             } finally {
                 fleetWatchJob?.cancel()
+                // Cancellation leaves the lease journal for the rest controller (or next process).
+                if (currentCoroutineContext().isActive && !preserveLease) AppPreferences.clearActiveRemoteLease(context)
             }
         }
     }
@@ -629,6 +657,7 @@ class SyncManager(
 
 sealed class SyncOutcome {
     data class Completed(val stationCount: Int) : SyncOutcome()
+    data class RecoveryPaused(val message: String) : SyncOutcome()
     data class HumanVerification(val message: String) : SyncOutcome()
     data class DetailRiskReleased(val message: String) : SyncOutcome()
     data class Skipped(

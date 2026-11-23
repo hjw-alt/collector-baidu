@@ -34,6 +34,8 @@ object NodeSnapshotReader {
             selected = node.isSelected,
             focused = node.isFocused,
             children = children,
+            visibleToUser = node.isVisibleToUser,
+            password = node.isPassword,
         )
     }
 }

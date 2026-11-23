@@ -4,6 +4,10 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import com.google.gson.Gson
+import com.tigercode.evcollector.core.engine.BaiduRestPhase
+import com.tigercode.evcollector.core.engine.BaiduWorkRestState
+import com.tigercode.evcollector.network.RemoteTaskLease
 import com.tigercode.evcollector.core.engine.CollectionPacingPolicy
 
 object AppPreferences {
@@ -149,11 +153,44 @@ object AppPreferences {
             .apply()
     }
 
+    @Synchronized
     fun setScanning(context: Context, scanning: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
+        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_SCANNING, scanning)
-            .apply()
+        if (!scanning) editor.remove("baidu_rest_phase").remove("baidu_rest_deadline").remove("baidu_rest_boot")
+        editor.commit()
+    }
+
+    fun baiduWorkRestState(context: Context): BaiduWorkRestState? = runCatching {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val phase = prefs.getString("baidu_rest_phase", null) ?: return null
+        BaiduWorkRestState(BaiduRestPhase.valueOf(phase),
+            prefs.getLong("baidu_rest_deadline", 0L), prefs.getInt("baidu_rest_boot", -1))
+    }.getOrNull()
+
+    @Synchronized
+    fun saveBaiduWorkRestState(context: Context, state: BaiduWorkRestState) {
+        if (!isScanning(context)) return
+        check(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("baidu_rest_phase", state.phase.name)
+            .putLong("baidu_rest_deadline", state.deadlineElapsedMs)
+            .putInt("baidu_rest_boot", state.bootCount).commit()) { "无法保存自动休息进度" }
+    }
+
+    fun activeRemoteLease(context: Context): RemoteTaskLease? = runCatching {
+        val value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString("baidu_active_remote_lease", null) ?: return null
+        Gson().fromJson(value, RemoteTaskLease::class.java)
+    }.getOrNull()
+
+    fun saveActiveRemoteLease(context: Context, lease: RemoteTaskLease) {
+        check(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("baidu_active_remote_lease", Gson().toJson(lease)).commit()) { "无法保存当前任务租约" }
+    }
+
+    fun clearActiveRemoteLease(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove("baidu_active_remote_lease").commit()
     }
 
     fun activationCode(context: Context): String =

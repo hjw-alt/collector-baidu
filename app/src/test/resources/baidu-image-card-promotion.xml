@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Foreground popup subtree from the device capture; unrelated background content omitted. -->
+<hierarchy>
+  <node class="android.widget.FrameLayout" bounds="[0,0][1080,2358]">
+    <node class="android.widget.FrameLayout" resource-id="com.baidu.BaiduMap:id/commonPopupContainer" bounds="[0,0][1080,2358]">
+      <node class="android.widget.FrameLayout" bounds="[0,0][1080,2358]" clickable="true">
+        <node class="android.widget.LinearLayout" bounds="[0,0][1080,2358]">
+          <node class="android.widget.FrameLayout" bounds="[0,0][1080,2358]">
+            <node class="android.widget.FrameLayout" bounds="[0,0][1080,2358]">
+              <node class="android.widget.LinearLayout" bounds="[0,0][1080,2358]" />
+              <node class="android.widget.FrameLayout" bounds="[0,567][1080,1790]">
+                <node class="android.widget.LinearLayout" bounds="[0,567][1080,1790]">
+                  <node class="android.widget.FrameLayout" bounds="[140,567][940,1632]">
+                    <node class="android.widget.LinearLayout" bounds="[140,567][940,1632]">
+                      <node class="android.widget.FrameLayout" bounds="[140,567][940,1632]">
+                        <node class="android.widget.ImageView" bounds="[140,567][940,1632]" clickable="true" />
+                        <node class="android.widget.FrameLayout" bounds="[197,1425][882,1540]" clickable="true">
+                          <node class="android.widget.ImageView" bounds="[197,1425][882,1540]" />
+                        </node>
+                      </node>
+                    </node>
+                  </node>
+                  <node class="android.widget.FrameLayout" bounds="[0,1704][1080,1790]">
+                    <node class="android.widget.ImageView" bounds="[497,1704][583,1790]" clickable="true" />
+                  </node>
+                </node>
+              </node>
+            </node>
+          </node>
+        </node>
+      </node>
+    </node>
+  </node>
+</hierarchy>

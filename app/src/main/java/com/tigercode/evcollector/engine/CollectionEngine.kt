@@ -1,5 +1,6 @@
 package com.tigercode.evcollector.engine
 
+import com.tigercode.evcollector.core.engine.BaiduPriceSheetWaitPolicy
 import com.tigercode.evcollector.core.engine.DailyTariffCache
 import com.tigercode.evcollector.core.engine.DailyTariffPolicy
 
@@ -9,6 +10,7 @@ import com.google.gson.Gson
 import com.tigercode.evcollector.AppPreferences
 import com.tigercode.evcollector.CollectionStatusNotifier
 import com.tigercode.evcollector.accessibility.ChargingAccessibilityService
+import com.tigercode.evcollector.accessibility.BaiduPromotionDetector
 import com.tigercode.evcollector.core.engine.DeviceUiPacingPolicy
 import com.tigercode.evcollector.core.model.CityDistricts
 import com.tigercode.evcollector.core.model.NodeSnapshot
@@ -17,20 +19,39 @@ import com.tigercode.evcollector.core.model.Rect
 import com.tigercode.evcollector.core.model.StationDetail
 import com.tigercode.evcollector.core.parser.BaiduChargingPileParser
 import com.tigercode.evcollector.core.parser.BaiduPriceParser
+import com.tigercode.evcollector.core.parser.BaiduCouponSheetDetector
 import com.tigercode.evcollector.core.parser.BaiduStationIdentityMatcher
 import com.tigercode.evcollector.core.parser.StationNameNormalizer
 import com.tigercode.evcollector.data.CollectorRepository
 import com.tigercode.evcollector.data.ScanTaskEntity
+import com.tigercode.evcollector.privileged.ShizukuMapController
+import com.tigercode.evcollector.recovery.BaiduAiRecoveryPolicy
+import com.tigercode.evcollector.recovery.BaiduAiRecoveryPausedException
+import com.tigercode.evcollector.recovery.BaiduUiBlockedException
+import com.tigercode.evcollector.recovery.DeepSeekKeyStore
+import com.tigercode.evcollector.recovery.DeepSeekRecoveryClient
+import com.tigercode.evcollector.recovery.RecoveryCause
+import com.tigercode.evcollector.recovery.RecoveryRateLimit
+import com.tigercode.evcollector.recovery.RecoveryStage
+import com.tigercode.evcollector.recovery.RecoveryStageWatchdog
+import com.tigercode.evcollector.recovery.returnToBaiduHome
+import com.tigercode.evcollector.recovery.runBaiduAiFallback
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.random.Random
 
 class StopRequestedException : IllegalStateException("已停止")
@@ -94,6 +115,7 @@ class CollectionEngine(
         const val SEARCH_CITY_RECOVERY_TIMEOUT_MS = 4_000L
         const val SEARCH_INPUT_ATTEMPTS = 3
         const val SUGGESTION_TIMEOUT_MS = 4_000L
+        val aiRecoveryRate = RecoveryRateLimit()
         val HENAN_SEARCH_LOCATIONS: Set<String> = buildSet {
             CityDistricts.cityDistricts.forEach { (city, districts) ->
                 add("${city}市")
@@ -130,6 +152,17 @@ class CollectionEngine(
     @Volatile private var stopRequested = false
     @Volatile private var pauseUntil = 0L
     @Volatile private var activeLocalTask: ScanTaskEntity? = null
+    private var localJob: Job? = null
+    // Scoped to the current station under runMutex; never active during idle or planned rest.
+    private var recoveryStage = RecoveryStage.OPEN_MAP
+    private var recoveryWatchdogEnabled = false
+    private var recoveryWatchdog: RecoveryStageWatchdog? = null
+
+    suspend fun stopAndReleaseLocalTask() {
+        localJob?.cancelAndJoin()
+        localJob = null
+        stop()
+    }
 
     fun addListener(listener: CollectionListener) {
         if (!listeners.contains(listener)) listeners.add(listener)
@@ -161,15 +194,17 @@ class CollectionEngine(
         if (running) return
         stopRequested = false
         running = true
-        scope.launch {
+        localJob = scope.launch {
             var done = 0
             try {
                 while (!stopRequested) {
                     val next = repository.nextPendingTask() ?: break
-                    val claimed = repository.claimTask(next)
-                    activeLocalTask = claimed
-                    emit(CollectionState.SCANNING_RESULTS, "采集 ${claimed.name}", done, claimed.name)
+                    val claimed = withContext(NonCancellable) {
+                        repository.claimTask(next).also { activeLocalTask = it }
+                    }
                     try {
+                        currentCoroutineContext().ensureActive()
+                        emit(CollectionState.SCANNING_RESULTS, "采集 ${claimed.name}", done, claimed.name)
                         runStationTask(
                             stationId = claimed.stationId,
                             stationName = claimed.name,
@@ -181,9 +216,15 @@ class CollectionEngine(
                         done++
                         emit(CollectionState.DONE, "已完成 $done 个站点", done, claimed.name)
                     } catch (error: Throwable) {
-                        if (error is kotlinx.coroutines.CancellationException) throw error
-                        if (error is StopRequestedException) {
-                            repository.releaseTask(claimed)
+                        if (error is BaiduAiRecoveryPausedException) {
+                            withContext(NonCancellable) { repository.releaseTask(claimed) }
+                            AppPreferences.setScanning(context, false)
+                            AppPreferences.setRemoteStatus(context, "DeepSeek 恢复未完成，采集已暂停", error.message.orEmpty())
+                            return@launch
+                        }
+                        if (error is kotlinx.coroutines.CancellationException || error is StopRequestedException) {
+                            withContext(NonCancellable) { repository.releaseTask(claimed) }
+                            if (error is kotlinx.coroutines.CancellationException) throw error
                             AppPreferences.appendLog(context, "已停止，任务已释放: ${claimed.name}")
                         } else if (error is SkippedStationException) {
                             repository.markSkipped(claimed, error.message ?: "跳过")
@@ -221,7 +262,8 @@ class CollectionEngine(
         longitude: Double?,
         remoteTaskId: String,
         dailyTariff: DailyTariffCache? = null,
-    ): StationDetail? = runStationTask(stationId, stationName, address, latitude, longitude, remoteTaskId, dailyTariff)
+        canRecover: () -> Boolean = { true },
+    ): StationDetail? = runStationTask(stationId, stationName, address, latitude, longitude, remoteTaskId, dailyTariff, canRecover)
 
     suspend fun runStationTask(
         stationId: String,
@@ -231,13 +273,14 @@ class CollectionEngine(
         longitude: Double?,
         remoteTaskId: String,
         dailyTariff: DailyTariffCache? = null,
+        canRecover: () -> Boolean = { true },
     ): StationDetail? = withContext(Dispatchers.Main.immediate) {
         runMutex.withLock {
             stopRequested = false
             running = true
             val startedAt = System.currentTimeMillis()
             try {
-                val detail = collectDetailWithRecovery(stationName, address, dailyTariff)
+                val detail = collectDetailWithRecovery(stationName, address, dailyTariff, canRecover)
                 if (detail != null) {
                     saveDetail(stationName, address, latitude, longitude, stationId, remoteTaskId, detail)
                     emit(CollectionState.DONE, "已采集 ${detail.stationName}", 1, detail.stationName)
@@ -246,7 +289,9 @@ class CollectionEngine(
                 detail
             } catch (error: Throwable) {
                 if (error is kotlinx.coroutines.CancellationException) throw error
-                if (error is SkippedStationException) {
+                if (error is BaiduAiRecoveryPausedException) {
+                    emit(CollectionState.PAUSED, error.message.orEmpty(), 0, stationName)
+                } else if (error is SkippedStationException) {
                     AppPreferences.appendLog(context, "无电价/桩信息，跳过站点: $stationName")
                     emit(CollectionState.DONE, "无电价/桩信息，跳过: $stationName", 0, stationName)
                 } else {
@@ -289,19 +334,35 @@ class CollectionEngine(
         val now = SystemClock.uptimeMillis()
         val inspectImage = forcePromotionImage || now - lastPromotionImageProbeAt >= 5_000L
         if (inspectImage) lastPromotionImageProbeAt = now
-        var target = service.observeBaiduPromotion(snapshot, inspectImage).target ?: return snapshot
+        val initialObservation = service.observeBaiduPromotion(snapshot, inspectImage)
+        var target = initialObservation.target ?: run {
+            if (initialObservation.blockingImageCard) {
+                throw BaiduUiBlockedException(RecoveryCause.POPUP, "检测到百度图片广告，尚未定位安全关闭按钮，停止操作背景页面")
+            }
+            if (BaiduPromotionDetector.isUpdateDialogVisible(snapshot)) {
+                throw BaiduUiBlockedException(RecoveryCause.POPUP, "检测到百度版本更新弹窗，尚未定位关闭按钮，停止操作背景页面")
+            }
+            if (service.isBaiduPlaceNameSheetVisible(snapshot)) {
+                throw BaiduUiBlockedException(RecoveryCause.POPUP, "检测到地点名称菜单，尚未定位安全取消按钮，停止操作背景页面")
+            }
+            if (BaiduCouponSheetDetector.isVisible(snapshot)) {
+                throw BaiduUiBlockedException(RecoveryCause.POPUP, "检测到充电优惠券套餐弹窗，尚未定位关闭按钮，停止点击背景价格入口")
+            }
+            if (recoveryWatchdogEnabled && (BaiduAiRecoveryPolicy.hasNodeDialog(snapshot) ||
+                    BaiduAiRecoveryPolicy.hasUnrecognisedBlockingAd(snapshot))) {
+                throw BaiduUiBlockedException(RecoveryCause.POPUP, "检测到未由本地规则处理的弹窗，停止操作背景页面")
+            }
+            return snapshot
+        }
         repeat(2) { attempt ->
             checkStop()
             AppPreferences.appendLog(context,
-                "检测到百度充电券广告：${target.evidence}；点击关闭（${attempt + 1}/2），位置=${target.bounds}")
-            if (!service.clickAt(target.bounds.centerX, target.bounds.centerY)) {
-                throw IllegalStateException("百度广告关闭点击未执行，保留任务失败原因")
+                "检测到百度弹窗：${target.evidence}；点击关闭（${attempt + 1}/2），位置=${target.bounds}")
+            // Revalidate the exact close control immediately before the single action.
+            snapshot = service.closeBaiduPromotionOnce(target) {
+                settleUi("关闭百度弹窗", 900L)
+                checkStop()
             }
-            // Dispatch success is not proof the overlay disappeared. Do not also click its parent.
-            settleUi("关闭百度充电券广告", 900L)
-            checkStop()
-            snapshot = service.freshSnapshot()
-                ?: throw IllegalStateException("关闭百度广告后暂时无法读取页面")
             if (isBaiduFeedbackPage(snapshot)) throw BaiduFeedbackPageException()
             var observation = service.observeBaiduPromotion(snapshot, inspectImage = true)
             lastPromotionImageProbeAt = SystemClock.uptimeMillis()
@@ -310,24 +371,120 @@ class CollectionEngine(
                 delay(500L)
                 checkStop()
                 snapshot = service.freshSnapshot()
-                    ?: throw IllegalStateException("关闭百度广告后无法确认当前页面")
+                    ?: throw BaiduUiBlockedException(RecoveryCause.POPUP, "关闭百度广告后无法确认当前页面")
                 observation = service.observeBaiduPromotion(snapshot, inspectImage = true)
             }
             val remaining = observation.target
             if (remaining == null) {
-                if (target.visual && !observation.imageChecked) {
-                    throw IllegalStateException("百度广告已点击关闭，但图像暂不可用，尚未确认关闭")
+                if (observation.blockingImageCard) {
+                    throw BaiduUiBlockedException(RecoveryCause.POPUP, "百度图片广告仍遮挡页面，尚未确认关闭")
                 }
-                AppPreferences.appendLog(context, "百度充电券广告已关闭，重新读取页面继续当前站点")
+                if (BaiduPromotionDetector.isUpdateDialogVisible(snapshot)) {
+                    throw BaiduUiBlockedException(RecoveryCause.POPUP, "百度版本更新弹窗仍未关闭，停止操作背景页面")
+                }
+                if (service.isBaiduPlaceNameSheetVisible(snapshot)) {
+                    throw BaiduUiBlockedException(RecoveryCause.POPUP, "地点名称菜单仍未关闭，停止操作背景页面")
+                }
+                if (BaiduCouponSheetDetector.isVisible(snapshot)) {
+                    throw BaiduUiBlockedException(RecoveryCause.POPUP, "充电优惠券套餐弹窗仍未关闭，停止点击背景价格入口")
+                }
+                if (target.visual && !observation.imageChecked) {
+                    throw BaiduUiBlockedException(RecoveryCause.POPUP, "百度广告已点击关闭，但图像暂不可用，尚未确认关闭")
+                }
+                if (recoveryWatchdogEnabled && BaiduAiRecoveryPolicy.hasNodeDialog(snapshot)) {
+                    throw BaiduUiBlockedException(RecoveryCause.POPUP, "关闭已知弹窗后仍有未识别弹窗，停止操作背景页面")
+                }
+                AppPreferences.appendLog(context, "百度弹窗已关闭，重新读取页面继续当前站点")
                 return snapshot
             }
             // Only repeat if a fresh observation still locates a close control.
             target = remaining
         }
-        throw IllegalStateException("百度充电券广告关闭两次后仍遮挡页面，本次不按无匹配跳过")
+        throw BaiduUiBlockedException(RecoveryCause.POPUP, "百度弹窗关闭两次后仍遮挡页面，本次不按无匹配跳过")
     }
 
-    private suspend fun collectDetailWithRecovery(stationName: String, address: String, dailyTariff: DailyTariffCache? = null): StationDetail {
+    private suspend fun collectDetailWithRecovery(
+        stationName: String, address: String, dailyTariff: DailyTariffCache?, canRecover: () -> Boolean,
+    ): StationDetail {
+        recoveryWatchdogEnabled = DeepSeekKeyStore.isConfigured(context)
+        try {
+            return runBaiduAiFallback(
+                collect = { collectDetailWithStandardRecovery(stationName, address, dailyTariff) },
+                recover = { recoveryWatchdogEnabled && tryAiRecovery(it, stationName, canRecover) },
+            )
+        } finally {
+            recoveryWatchdogEnabled = false
+        }
+    }
+
+    private suspend fun tryAiRecovery(cause: RecoveryCause, stationName: String, canRecover: () -> Boolean): Boolean {
+        currentCoroutineContext().ensureActive()
+        checkStop()
+        if (!running || !canRecover() || ShizukuMapController.isBusy) return false
+        val service = ChargingAccessibilityService.current() ?: return false
+        val scene = service.readAiRecoveryScene() ?: return false
+        val evidence = BaiduAiRecoveryPolicy.evidence(scene.snapshot, recoveryStage, cause) ?: return false
+        val key = withContext(Dispatchers.IO) { DeepSeekKeyStore.read(context) } ?: return false
+        checkStop()
+        if (!canRecover() || ShizukuMapController.isBusy || !aiRecoveryRate.tryAcquire(SystemClock.elapsedRealtime())) return false
+        AppPreferences.appendLog(context, "DeepSeek 辅助判定: ${evidence.stage}/${evidence.cause}/${evidence.page}，可选关闭节点=${evidence.dialogNodes.count { it.dismiss }}")
+        val decision = withTimeoutOrNull(10_000L) { DeepSeekRecoveryClient.decide(key, evidence) }
+        currentCoroutineContext().ensureActive()
+        checkStop()
+        val firstAction = decision?.decision?.firstAction
+        if (firstAction == null) {
+            AppPreferences.appendLog(context, "DeepSeek 未返回可执行动作，保留原采集异常处理")
+            return false
+        }
+        fun canOperate(): Boolean = running && !stopRequested && canRecover() && !ShizukuMapController.isBusy &&
+            DeepSeekKeyStore.isConfigured(context) && ChargingAccessibilityService.current() === service
+        emit(CollectionState.PAUSED, "DeepSeek 暂停采集，正在处理异常并确认百度地图首页", 0, stationName)
+        val initial = if (canOperate()) service.readAiRecoveryScene() else null
+        if (initial == null || (initial != scene && !BaiduAiRecoveryPolicy.isHome(initial.snapshot))) {
+            AppPreferences.appendLog(context, "DeepSeek 建议未执行：页面已变更或不再满足操作条件")
+            throw BaiduAiRecoveryPausedException()
+        }
+        val home = returnToBaiduHome(
+            initial = initial,
+            firstAction = firstAction,
+            readScene = { if (canOperate()) service.readAiRecoveryScene() else null },
+            applyAction = { expected, action ->
+                val nodeId = decision.nodeId.takeIf { action == firstAction }
+                service.applyAiRecoveryAction(expected, action, nodeId, ::canOperate).also { applied ->
+                    if (applied) AppPreferences.appendLog(context, "DeepSeek 恢复：已提交${action.label}，重新确认百度页面")
+                    else AppPreferences.appendLog(context, "DeepSeek 恢复：未执行${action.label}，页面或控件校验未通过")
+                }
+            },
+            awaitNextRead = {
+                delay(500L)
+                checkStop()
+            },
+        )
+        checkStop()
+        if (home == null || !canOperate()) {
+            throw BaiduAiRecoveryPausedException()
+        }
+        emit(CollectionState.SCANNING_RESULTS, "DeepSeek 恢复：已确认百度地图首页，继续采集当前站点", 0, stationName)
+        return true
+    }
+
+    private suspend fun <T : Any> runRecoveryStage(stage: RecoveryStage, block: suspend () -> T): T {
+        recoveryStage = stage
+        if (!recoveryWatchdogEnabled) return block()
+        val timeout = if (uiPacing.enabled) stage.timeoutMs * 2 else stage.timeoutMs
+        recoveryWatchdog = RecoveryStageWatchdog(timeout, SystemClock.elapsedRealtime())
+        return try {
+            block().also { checkStop() }
+        } finally {
+            recoveryWatchdog = null
+        }
+    }
+
+    private fun markRecoveryProgress(marker: String) {
+        recoveryWatchdog?.markProgress(marker, SystemClock.elapsedRealtime())
+    }
+
+    private suspend fun collectDetailWithStandardRecovery(stationName: String, address: String, dailyTariff: DailyTariffCache?): StationDetail {
         var recoveries = 0
         while (true) {
             checkStop()
@@ -399,25 +556,67 @@ class CollectionEngine(
     private suspend fun collectDetail(stationName: String, address: String, dailyTariff: DailyTariffCache? = null): StationDetail {
         emit(CollectionState.WAITING_SERVICE, "检查无障碍服务", 0, stationName)
         val service = waitForService() ?: throw IllegalStateException("无障碍服务未连接")
-        ensureBaiduForeground(service)
+        runRecoveryStage(RecoveryStage.OPEN_MAP) { ensureBaiduForeground(service) }
         // 1. 确认输入页、可编辑状态和焦点，再写入并回读核对完整站名。
-        prepareSearchInput(service, stationName)
+        runRecoveryStage(RecoveryStage.SEARCH_INPUT) { prepareSearchInput(service, stationName) }
         // 2. 先等待地点联想；没有匹配项时，再提交完整搜索。
-        val destination = openMatchingSuggestion(service, stationName)
-            ?: submitSearchWithOneRetry(service, stationName)
-            ?: throw StationNotFoundException(stationName)
+        val destination = runRecoveryStage(RecoveryStage.SEARCH) {
+            openMatchingSuggestion(service, stationName)
+                ?: submitSearchWithOneRetry(service, stationName)
+                ?: throw StationNotFoundException(stationName)
+        }
 
         // 3. 搜索可直接打开详情；列表路径仍须重新核对位置后点击。
-        val detailSnapshot = openSearchDestination(service, stationName, destination)
-            ?: run {
-                emit(CollectionState.OPENING_DETAIL, "详情页尚未打开，重新确认搜索后的页面", 0, stationName)
-                val refreshed = waitForResult(service, stationName)
-                    ?: throw IllegalStateException("详情页未打开，结果列表也未确认目标站点: $stationName")
-                openSearchDestination(service, stationName, refreshed)
-            }
-            ?: throw IllegalStateException("详情页未打开: $stationName")
+        val detailSnapshot = runRecoveryStage(RecoveryStage.OPEN_DETAIL) {
+            openSearchDestination(service, stationName, destination)
+                ?: run {
+                    emit(CollectionState.OPENING_DETAIL, "详情页尚未打开，重新确认搜索后的页面", 0, stationName)
+                    val refreshed = waitForResult(service, stationName)
+                        ?: throw BaiduUiBlockedException(RecoveryCause.UNEXPECTED_PAGE, "详情页未打开，结果列表也未确认目标站点: $stationName")
+                    openSearchDestination(service, stationName, refreshed)
+                }
+                ?: throw BaiduUiBlockedException(RecoveryCause.UNEXPECTED_PAGE, "详情页未打开: $stationName")
+        }
 
         // 4. 解析详情
+        var detail = runRecoveryStage(RecoveryStage.READ_DETAIL) { readBaiduDetail(service, stationName, address, detailSnapshot) }
+        var resultPeriods: List<PricePeriod> = emptyList()
+        var priceReadAt = 0L
+
+        runRecoveryStage(RecoveryStage.PRICE) {
+            val reused = DailyTariffPolicy.reuse(detail, dailyTariff, "BAIDU")
+            if (reused != null) {
+                detail = reused
+                emit(CollectionState.READING_PRICE, "当前价核对一致，沿用今日分时方案，仅更新桩状态", 0, stationName)
+                AppPreferences.appendLog(context, "分时价格沿用今日方案，原采集时间=${reused.priceScheduleCapturedAt}: $stationName")
+            } else {
+                // 6. 从当前详情页位置继续向下找分时电价，检查每次滚动后的页面。
+                emit(CollectionState.OPENING_PRICE, "查找分时电价入口", 0, stationName)
+                val priceLookup = openPriceSheet(service, stationName, detail)
+                detail = priceLookup.detail
+                if (priceLookup.opened) {
+                    val sheet = waitForPriceSheet(service, stationName, priceLookup.sheetAlreadyVisible)
+                    if (sheet != null) {
+                        emit(CollectionState.READING_PRICE, "读取分时电价", 0, stationName)
+                        val periods = BaiduPriceParser.periods(sheet)
+                        if (periods.isNotEmpty()) {
+                            resultPeriods = periods
+                            priceReadAt = System.currentTimeMillis()
+                        }
+                    }
+                }
+            }
+        }
+        // Do not trigger AI while leaving a station after data has already been read.
+        emit(CollectionState.RETURNING, "返回搜索页", 1, stationName)
+        returnToSearchPage(service)
+        return if (resultPeriods.isEmpty()) detail
+        else detail.copy(fastPrices = resultPeriods, priceTrendTitle = "价格详情", priceScheduleCapturedAt = priceReadAt, priceScheduleReused = false)
+    }
+
+    private suspend fun readBaiduDetail(
+        service: ChargingAccessibilityService, stationName: String, address: String, detailSnapshot: NodeSnapshot,
+    ): StationDetail {
         emit(CollectionState.READING_DETAIL, "读取站点详情", 0, stationName)
         var loadedSnapshot = detailSnapshot
         var hasData = hasPriceOrPile(loadedSnapshot)
@@ -435,45 +634,13 @@ class CollectionEngine(
         if (!hasData) {
             throw SkippedStationException(stationName)
         }
-        var detail = mergeStationDetail(
+        val detail = mergeStationDetail(
             parseDetail(detailSnapshot, stationName, address),
             parseDetail(loadedSnapshot, stationName, address),
         )
 
         // 5. 仅在站点详情首页读取电桩卡片，不进入逐桩详情。
-        detail = collectPileCardSummaries(service, detail)
-        var resultPeriods: List<PricePeriod> = emptyList()
-        var priceReadAt = 0L
-
-        val reused = DailyTariffPolicy.reuse(detail, dailyTariff, "BAIDU")
-        if (reused != null) {
-            detail = reused
-            emit(CollectionState.READING_PRICE, "当前价核对一致，沿用今日分时方案，仅更新桩状态", 0, stationName)
-            AppPreferences.appendLog(context, "分时价格沿用今日方案，原采集时间=${reused.priceScheduleCapturedAt}: $stationName")
-        } else {
-            // 6. 从当前详情页位置继续向下找分时电价，检查每次滚动后的页面。
-            emit(CollectionState.OPENING_PRICE, "查找分时电价入口", 0, stationName)
-            val priceLookup = openPriceSheet(service, stationName, detail)
-            detail = priceLookup.detail
-            if (priceLookup.opened) {
-                val sheet = waitForPriceSheet(service, stationName, priceLookup.sheetAlreadyVisible)
-                if (sheet != null) {
-                    emit(CollectionState.READING_PRICE, "读取分时电价", 0, stationName)
-                    val periods = BaiduPriceParser.periods(sheet)
-                    if (periods.isNotEmpty()) {
-                        resultPeriods = periods
-                        priceReadAt = System.currentTimeMillis()
-                    }
-                }
-            }
-
-        }
-
-        // 7. 返回搜索页
-        emit(CollectionState.RETURNING, "返回搜索页", 1, stationName)
-        returnToSearchPage(service)
-        return if (resultPeriods.isEmpty()) detail
-        else detail.copy(fastPrices = resultPeriods, priceTrendTitle = "价格详情", priceScheduleCapturedAt = priceReadAt, priceScheduleReused = false)
+        return collectPileCardSummaries(service, detail)
     }
 
     private suspend fun waitForService(timeoutMs: Long = 15_000L): ChargingAccessibilityService? {
@@ -588,6 +755,7 @@ class CollectionEngine(
                 if (editable == null) {
                     failure = "搜索框不可编辑"
                 } else {
+                    markRecoveryProgress("search-input-ready")
                     emit(CollectionState.SCANNING_RESULTS, "搜索框可编辑，确认输入焦点", 0, stationName)
                     if (!editable.focused) {
                         service.focusSearchInput()
@@ -597,6 +765,7 @@ class CollectionEngine(
                     if (focused == null) {
                         failure = "搜索框未获得焦点"
                     } else {
+                        markRecoveryProgress("search-input-focused")
                         emit(CollectionState.SCANNING_RESULTS, "写入站名并核对输入内容", 0, stationName)
                         val actionAccepted = service.setFocusedText(stationName)
                         AppPreferences.appendLog(context, "搜索词写入动作已提交=$actionAccepted，等待回读核对")
@@ -622,7 +791,7 @@ class CollectionEngine(
             )
             if (attempt + 1 < SEARCH_INPUT_ATTEMPTS) delay(400L)
         }
-        throw IllegalStateException("$failure（已尝试${SEARCH_INPUT_ATTEMPTS}次）: $stationName")
+        throw BaiduUiBlockedException(RecoveryCause.UNEXPECTED_PAGE, "$failure（已尝试${SEARCH_INPUT_ATTEMPTS}次）: $stationName")
     }
 
     private data class SuggestionMatch(val label: String, val point: Pair<Int, Int>, val score: Int)
@@ -1240,6 +1409,7 @@ class CollectionEngine(
             if (requiredCity != null && options.currentCity != requiredCity) {
                 throw IllegalStateException("城市切换尚未生效，不能跳过: $stationName")
             }
+            markRecoveryProgress("confirmed-results:${options.currentCity}")
             if (isHenanSearchLocation(options.currentCity)) visitedCities += options.currentCity
             val newlyExcluded = options.cities.map { it.name }
                 .filter { !isHenanSearchLocation(it) && excludedCities.add(it) }
@@ -1434,7 +1604,7 @@ class CollectionEngine(
             }
             delay(350L)
         }
-        throw IllegalStateException("搜索后未确认结果列表或目标详情，保留任务重试: $stationName")
+        throw BaiduUiBlockedException(RecoveryCause.UNEXPECTED_PAGE, "搜索后未确认结果列表或目标详情，保留任务重试: $stationName")
     }
 
     /** 在结果列表下半屏寻找与目标站名匹配的卡片。 */
@@ -1913,6 +2083,9 @@ class CollectionEngine(
 
     private fun checkStop() {
         if (stopRequested) throw StopRequestedException()
+        if (recoveryWatchdog?.stalled(SystemClock.elapsedRealtime()) == true) {
+            throw BaiduUiBlockedException(RecoveryCause.STAGE_TIMEOUT, "采集阶段长时间无进展: ${recoveryStage.name}")
+        }
     }
 
     private fun hasPriceOrPile(snapshot: NodeSnapshot): Boolean {
@@ -2015,7 +2188,7 @@ class CollectionEngine(
     }
 
     private fun visiblePriceEntry(service: ChargingAccessibilityService, snapshot: NodeSnapshot): Rect? {
-        if (BaiduPriceParser.findSheet(snapshot) != null) return null
+        if (BaiduPriceParser.findSheet(snapshot) != null || BaiduCouponSheetDetector.isVisible(snapshot)) return null
         val safeTop = (service.screenHeightPx() * 0.10f).toInt()
         val safeBottom = (service.screenHeightPx() * 0.90f).toInt()
         val screenWidth = service.screenWidthPx()
@@ -2083,48 +2256,51 @@ class CollectionEngine(
         stationName: String,
         sheetAlreadyVisible: Boolean,
     ): NodeSnapshot? {
-        val startedAt = System.currentTimeMillis()
-        val deadline = startedAt + uiTimeout(15_000L)
-        var retryClicks = 0
-        var sheetObserved = sheetAlreadyVisible
+        val waitPolicy = BaiduPriceSheetWaitPolicy(SystemClock.uptimeMillis(), uiTimeout(15_000L))
+        if (sheetAlreadyVisible) waitPolicy.observeSheet()
         fun readySheet(snapshot: NodeSnapshot?): NodeSnapshot? {
             val sheet = snapshot?.let { BaiduPriceParser.findSheet(it) } ?: return null
-            if (!sheetObserved) {
+            if (!waitPolicy.sheetObserved) {
                 emit(CollectionState.READING_PRICE, "价格弹层已打开，等待电价内容", 0, stationName)
             }
-            sheetObserved = true
+            waitPolicy.observeSheet()
             if (BaiduPriceParser.periods(sheet).isNotEmpty() || BaiduPriceParser.hasNoPrice(sheet)) {
                 emit(CollectionState.READING_PRICE, "价格弹层内容已识别", 0, stationName)
                 return sheet
             }
             return null
         }
-        while (System.currentTimeMillis() < deadline) {
+        while (waitPolicy.remainingMs(SystemClock.uptimeMillis()) > 0) {
             checkStop()
             readySheet(collectionSnapshot(service))?.let { return it }
-            val elapsed = System.currentTimeMillis() - startedAt
-            if (!sheetObserved && elapsed > 3_000L && retryClicks < 2) {
+            if (waitPolicy.shouldRetry(SystemClock.uptimeMillis())) {
                 // 补点前再取一次快照；一旦见过弹层标题，本次等待中都禁止补点背景。
                 checkStop()
                 val retrySnapshot = collectionSnapshot(service, forcePromotionImage = true)
                 readySheet(retrySnapshot)?.let { return it }
-                if (!sheetObserved && retrySnapshot != null) {
+                if (waitPolicy.shouldRetry(SystemClock.uptimeMillis()) && retrySnapshot != null) {
                     val entry = visiblePriceEntry(service, retrySnapshot)
                     if (entry != null) {
                         checkStop()
-                        retryClicks++
+                        waitPolicy.recordRetry(SystemClock.uptimeMillis())
+                        val retryClicks = waitPolicy.retryClicks
                         val clicked = service.clickAt(entry.centerX, entry.centerY)
                         val message = if (clicked) "尚未识别到价格弹层，补点第 $retryClicks 次"
                             else "价格详情补点第 $retryClicks 次失败，继续等待"
                         emit(CollectionState.OPENING_PRICE, message, 0, stationName)
-                        settleUi("补点分时电价入口", 1_000L)
+                        if (retryClicks == 2) {
+                            emit(CollectionState.OPENING_PRICE, "第二次补点后最多等待5秒，期间不再点击价格入口", 0, stationName)
+                        } else {
+                            settleUi("补点分时电价入口", 1_000L)
+                        }
                     }
                 }
             }
-            delay(700L)
+            delay(minOf(700L, waitPolicy.remainingMs(SystemClock.uptimeMillis())))
         }
-        val message = if (sheetObserved) "价格弹层已打开，但15秒内未读到时段，保留页面电价"
-            else "价格弹层15秒内未识别到，保留页面电价"
+        val message = if (waitPolicy.sheetObserved) "价格弹层已打开，但等待结束仍未读到时段，保留页面电价"
+            else if (waitPolicy.retryClicks == 2) "第二次补点后已等待5秒，价格弹层仍未识别到，保留页面电价"
+            else "价格弹层等待结束仍未识别到，保留页面电价"
         emit(CollectionState.READING_PRICE, message, 0, stationName)
         return null
     }

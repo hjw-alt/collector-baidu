@@ -10,6 +10,18 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
+import android.provider.Settings
+import com.tigercode.evcollector.core.engine.BaiduRestPhase
+import com.tigercode.evcollector.core.engine.BaiduWorkRestPolicy
+import com.tigercode.evcollector.core.engine.BaiduWorkRestState
+import com.tigercode.evcollector.network.TaskLeaseReleaseClient
+import com.tigercode.evcollector.privileged.ShizukuMapController
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.tigercode.evcollector.accessibility.ChargingAccessibilityService
@@ -36,6 +48,8 @@ class CollectorKeepAliveService : Service() {
     // 并由 PARTIAL_WAKE_LOCK 保证设备在长期插电采集时不会进入 CPU 深度休眠。
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var loopJob: Job? = null
+    private var cycleJob: Job? = null
+    private var restAlarmDeadline = 0L
     private var fleetWatchJob: Job? = null
     private var engine: CollectionEngine? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -50,7 +64,9 @@ class CollectorKeepAliveService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             AppPreferences.setScanning(this, false)
+            cycleJob?.cancel()
             engine?.stop()
+            CooldownAlarmScheduler.cancel(this)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -73,19 +89,21 @@ class CollectorKeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        cycleJob?.cancel()
         engine?.stop()
         loopJob?.cancel()
         fleetWatchJob?.cancel()
         scope.cancel()
         engine = null
         releaseKeepAliveLock()
+        if (!AppPreferences.isScanning(this)) CooldownAlarmScheduler.cancel(this)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startSyncLoop() {
-        if (loopJob?.isActive == true) return
+        if (cycleJob?.isActive == true) return
         val repository = CollectorRepository(this)
         var engineRef: CollectionEngine? = null
         val engine = CollectionEngine(this, repository) {
@@ -96,148 +114,292 @@ class CollectorKeepAliveService : Service() {
         engineRef = engine
         this.engine = engine
         startFleetWatcher()
-        loopJob = scope.launch {
-            if (AppPreferences.isLocalQueueMode(this@CollectorKeepAliveService)) {
-                updateNotification("本地任务采集启动")
-                engine.startLocal("", "", "", com.tigercode.evcollector.engine.CollectionListener { _, _, _, _ -> })
-                while (isActive && AppPreferences.isScanning(this@CollectorKeepAliveService)) {
+        cycleJob = scope.launch {
+            try {
+                runWorkRestCycle(repository, engine)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                AppPreferences.setScanning(this@CollectorKeepAliveService, false)
+                AppPreferences.setRemoteStatus(this@CollectorKeepAliveService, "自动采集已暂停", error.message.orEmpty())
+                AppPreferences.appendLog(this@CollectorKeepAliveService, "自动采集异常退出：${error.message}")
+            } finally {
+                withContext(NonCancellable) { engine.stopAndReleaseLocalTask() }
+                if (!AppPreferences.isScanning(this@CollectorKeepAliveService)) {
+                    CooldownAlarmScheduler.cancel(this@CollectorKeepAliveService)
+                    stopSelf()
+                }
+            }
+        }
+    }
+
+    private fun collectionEnabled(): Boolean = AppPreferences.isScanning(this)
+
+    private fun saveCycle(state: BaiduWorkRestState) = AppPreferences.saveBaiduWorkRestState(this, state)
+
+    private fun restStatus(message: String) {
+        AppPreferences.setRemoteStatus(this, message)
+        updateNotification(message)
+    }
+
+    private suspend fun runWorkRestCycle(repository: CollectorRepository, engine: CollectionEngine) {
+        val bootCount = Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, 0)
+        while (currentCoroutineContext().isActive && collectionEnabled()) {
+            val now = SystemClock.elapsedRealtime()
+            val saved = AppPreferences.baiduWorkRestState(this)
+            val state = BaiduWorkRestPolicy.restore(saved, now, bootCount)
+            if (saved != state) saveCycle(state)
+            when (state.phase) {
+                BaiduRestPhase.COLLECTING -> {
+                    val remaining = BaiduWorkRestPolicy.remainingMs(state, now)
+                    if (remaining == 0L) {
+                        saveCycle(BaiduWorkRestPolicy.stopping(bootCount))
+                        continue
+                    }
+                    // Recover a lease left by a killed process before claiming any new station.
+                    if (!TaskLeaseReleaseClient.releasePending(this)) {
+                        updateNotification("等待归还中断任务，暂不领取新站点")
+                        delay(5_000L)
+                        continue
+                    }
+                    if (!collectionEnabled()) break
+                    AppPreferences.appendLog(this, "百度自动轮休：采集满2小时后释放当前任务并休息5分钟")
+                    withTimeoutOrNull(BaiduWorkRestPolicy.remainingMs(state, SystemClock.elapsedRealtime()).coerceAtLeast(1L)) {
+                        coroutineScope {
+                            loopJob = launch { runCollectionLoop(repository, engine) }
+                            loopJob?.join()
+                        }
+                    }
+                    // withTimeout has joined all work, including upload/lease renewal cancellation.
+                    if (collectionEnabled()) {
+                        saveCycle(BaiduWorkRestPolicy.stopping(bootCount))
+                        AppPreferences.appendLog(this, "采集已满2小时，停止当前采集并准备释放任务")
+                    }
+                }
+                BaiduRestPhase.STOPPING -> {
+                    engine.stopAndReleaseLocalTask()
+                    if (!TaskLeaseReleaseClient.releasePending(this)) {
+                        updateNotification("自动休息：任务尚未释放，等待重试")
+                        delay(5_000L)
+                        continue
+                    }
+                    if (!collectionEnabled()) break
+                    restStatus("自动休息：正在关闭百度地图后台")
+                    val result = ShizukuMapController.forceStopMap(this) {
+                        engine.isRunning() || !collectionEnabled() ||
+                            AppPreferences.baiduWorkRestState(this)?.phase != BaiduRestPhase.STOPPING
+                    }
+                    if (!collectionEnabled()) break
+                    if (!result.success) {
+                        restStatus("自动休息：${result.message}；保持暂停，5秒后重试")
+                        delay(5_000L)
+                        continue
+                    }
+                    val switched = ChargingAccessibilityService.current()?.launchCollectorApp() == true
+                    if (!collectionEnabled()) break
+                    if (!switched) {
+                        restStatus("百度后台已关闭，等待无障碍服务返回采集App")
+                        delay(5_000L)
+                        continue
+                    }
+                    saveCycle(BaiduWorkRestPolicy.resting(SystemClock.elapsedRealtime(), bootCount))
+                    AppPreferences.appendLog(this, "百度地图后台已关闭，已回到采集App，开始休息5分钟")
+                }
+                BaiduRestPhase.RESTING -> {
+                    val remaining = BaiduWorkRestPolicy.remainingMs(state, now)
+                    if (remaining == 0L) {
+                        saveCycle(state.copy(phase = BaiduRestPhase.REOPENING))
+                        continue
+                    }
+                    if (restAlarmDeadline != state.deadlineElapsedMs) {
+                        CooldownAlarmScheduler.schedule(this, System.currentTimeMillis() + remaining)
+                        restAlarmDeadline = state.deadlineElapsedMs
+                    }
+                    val seconds = (remaining + 999L) / 1000L
+                    restStatus("自动休息中：剩余${seconds / 60}分${seconds % 60}秒，百度后台已关闭")
+                    delay(minOf(1_000L, remaining))
+                }
+                BaiduRestPhase.REOPENING -> {
+                    CooldownAlarmScheduler.cancel(this)
+                    restAlarmDeadline = 0L
+                    if (!TaskLeaseReleaseClient.releasePending(this)) {
+                        delay(5_000L)
+                        continue
+                    }
+                    try {
+                        // A fleet-wide stop during the break must never be bypassed by auto-resume.
+                        FleetControlClient.requireAllowed(this, FleetControlClient.api(this))
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        restStatus("休息已结束，等待服务器确认允许继续采集")
+                        delay(5_000L)
+                        continue
+                    }
+                    if (!collectionEnabled()) break
+                    val opened = !ShizukuMapController.isBusy &&
+                        ChargingAccessibilityService.current()?.launchAmap() == true
+                    if (!collectionEnabled()) break
+                    if (!opened) {
+                        restStatus("休息已结束，等待无障碍服务重新打开百度地图")
+                        delay(5_000L)
+                        continue
+                    }
+                    saveCycle(BaiduWorkRestPolicy.collecting(SystemClock.elapsedRealtime(), bootCount))
+                    AppPreferences.appendLog(this, "5分钟休息结束，百度地图已打开，开始下一段2小时采集")
+                    restStatus("休息结束，继续百度采集")
+                }
+            }
+        }
+    }
+
+    private suspend fun runCollectionLoop(repository: CollectorRepository, engine: CollectionEngine) {
+        if (AppPreferences.isLocalQueueMode(this@CollectorKeepAliveService)) {
+            updateNotification("本地任务采集启动")
+            engine.startLocal("", "", "", com.tigercode.evcollector.engine.CollectionListener { _, _, _, _ -> })
+            try {
+                while (currentCoroutineContext().isActive && AppPreferences.isScanning(this@CollectorKeepAliveService)) {
                     updateNotification(if (engine.isRunning()) "本地任务采集中" else "本地任务已暂停")
                     delay(3000)
                 }
-                return@launch
+            } finally {
+                withContext(NonCancellable) { engine.stopAndReleaseLocalTask() }
             }
-            while (isActive && AppPreferences.isScanning(this@CollectorKeepAliveService)) {
-                if (!ChargingAccessibilityService.isConnected()) {
-                    val accessibilityEnabled = ChargingAccessibilityService.isEnabled(
-                        this@CollectorKeepAliveService,
-                    )
-                    AppPreferences.setRemoteStatus(
-                        this@CollectorKeepAliveService,
-                        "等待无障碍服务",
-                        if (accessibilityEnabled) {
-                            "采集助手已开启，正在等待系统重新连接；若长时间无响应请关闭后重新开启一次"
-                        } else {
-                            "请在系统设置中开启采集助手"
-                        },
-                    )
-                    updateNotification("等待无障碍服务")
-                    delay(5000)
-                    continue
-                }
-                // 在领取下一条远程任务前完成批次冷却，避免占着租约等待。
-                val cooldownEndAt = engine.batchCooldownEndAt()
-                val cooldownActive = cooldownEndAt > System.currentTimeMillis()
-                if (cooldownActive) {
-                    CooldownAlarmScheduler.schedule(this@CollectorKeepAliveService, cooldownEndAt)
-                    if (shouldKeepCollectorForegroundDuringCooldown()) {
-                        val switched = ChargingAccessibilityService.current()
-                            ?.launchCollectorApp() == true
-                        AppPreferences.appendLog(
-                            this@CollectorKeepAliveService,
-                            if (switched) {
-                                "批次休息开始，已切换至采集 App 等待"
-                            } else {
-                                "批次休息开始，切换采集 App 失败"
-                            },
-                        )
-                        updateNotification("批次休息中，采集 App 保持前台")
-                    }
-                } else {
-                    CooldownAlarmScheduler.cancel(this@CollectorKeepAliveService)
-                }
-                engine.awaitReadyForNextTask()
-                CooldownAlarmScheduler.cancel(this@CollectorKeepAliveService)
-                if (cooldownActive && shouldKeepCollectorForegroundDuringCooldown()) {
-                    val switchedBack = ChargingAccessibilityService.current()
-                        ?.launchAmap() == true
+            return
+        }
+        while (currentCoroutineContext().isActive && AppPreferences.isScanning(this@CollectorKeepAliveService)) {
+            if (!ChargingAccessibilityService.isConnected()) {
+                val accessibilityEnabled = ChargingAccessibilityService.isEnabled(
+                    this@CollectorKeepAliveService,
+                )
+                AppPreferences.setRemoteStatus(
+                    this@CollectorKeepAliveService,
+                    "等待无障碍服务",
+                    if (accessibilityEnabled) {
+                        "采集助手已开启，正在等待系统重新连接；若长时间无响应请关闭后重新开启一次"
+                    } else {
+                        "请在系统设置中开启采集助手"
+                    },
+                )
+                updateNotification("等待无障碍服务")
+                delay(5000)
+                continue
+            }
+            // 在领取下一条远程任务前完成批次冷却，避免占着租约等待。
+            val cooldownEndAt = engine.batchCooldownEndAt()
+            val cooldownActive = cooldownEndAt > System.currentTimeMillis()
+            if (cooldownActive) {
+                CooldownAlarmScheduler.schedule(this@CollectorKeepAliveService, cooldownEndAt)
+                if (shouldKeepCollectorForegroundDuringCooldown()) {
+                    val switched = ChargingAccessibilityService.current()
+                        ?.launchCollectorApp() == true
                     AppPreferences.appendLog(
                         this@CollectorKeepAliveService,
-                        if (switchedBack) {
-                            "批次休息结束，已切换回百度地图"
+                        if (switched) {
+                            "批次休息开始，已切换至采集 App 等待"
                         } else {
-                            "批次休息结束，切换回百度地图失败"
+                            "批次休息开始，切换采集 App 失败"
                         },
                     )
-                    updateNotification("批次休息结束，正在返回百度采集")
+                    updateNotification("批次休息中，采集 App 保持前台")
                 }
-                if (!isActive || !AppPreferences.isScanning(this@CollectorKeepAliveService)) break
-                updateNotification("正在同步服务端")
-                // 有任务时快速进入下一轮；没有任务时保留较长轮询间隔，降低服务端请求频率。
-                val nextSyncDelayMs = when (
-                    val outcome = SyncManager(
-                        this@CollectorKeepAliveService,
-                        repository,
-                        engine,
-                    ).runOnce()
-                ) {
-                    is SyncOutcome.Completed -> {
-                        val message = "任务已完成，采集 ${outcome.stationCount} 个站点，等待下一条任务"
-                        AppPreferences.setRemoteStatus(this@CollectorKeepAliveService, message)
-                        updateNotification(message)
-                        showStepStatus(message)
-                        3_000L
-                    }
-                    is SyncOutcome.Skipped -> {
-                        val message = "任务已跳过：${outcome.stationName}"
-                        AppPreferences.setRemoteStatus(
-                            this@CollectorKeepAliveService,
-                            message,
-                            outcome.reason,
-                        )
-                        updateNotification("任务已跳过，等待下一条任务")
-                        showStepStatus(message)
-                        3_000L
-                    }
-                    is SyncOutcome.DetailRiskReleased -> {
-                        val message = "详情页风控，当前任务已释放，继续列表采集"
-                        AppPreferences.setRemoteStatus(
-                            this@CollectorKeepAliveService,
-                            "详情页风控，继续采集",
-                            outcome.message,
-                        )
-                        updateNotification(message)
-                        showStepStatus(message)
-                        8_000L
-                    }
-                    is SyncOutcome.HumanVerification -> {
-                        val message = "检测到人机验证，当前任务已释放，返回列表继续采集"
-                        AppPreferences.setRemoteStatus(
-                            this@CollectorKeepAliveService,
-                            "人机验证，继续采集",
-                            outcome.message,
-                        )
-                        updateNotification(message)
-                        showStepStatus(message)
-                        8_000L
-                    }
-                    is SyncOutcome.Failed -> {
-                        AppPreferences.setRemoteStatus(
-                            this@CollectorKeepAliveService,
-                            "同步失败",
-                            outcome.message,
-                        )
-                        updateNotification("同步失败，等待重试")
-                        showStepStatus("同步失败：${outcome.message}")
-                        8_000L
-                    }
-                    is SyncOutcome.NoTask -> {
-                        val message = "当前暂无待领取任务，正在等待新任务"
-                        AppPreferences.setRemoteStatus(
-                            this@CollectorKeepAliveService,
-                            "等待任务",
-                            message,
-                        )
-                        updateNotification("等待任务")
-                        showStepStatus(message)
-                        15_000L
-                    }
-                }
-                delay(nextSyncDelayMs)
+            } else {
+                CooldownAlarmScheduler.cancel(this@CollectorKeepAliveService)
             }
-            stopSelf()
-        }
-        loopJob?.invokeOnCompletion {
-            if (!AppPreferences.isScanning(this@CollectorKeepAliveService)) stopSelf()
+            engine.awaitReadyForNextTask()
+            CooldownAlarmScheduler.cancel(this@CollectorKeepAliveService)
+            if (cooldownActive && shouldKeepCollectorForegroundDuringCooldown()) {
+                val switchedBack = ChargingAccessibilityService.current()
+                    ?.launchAmap() == true
+                AppPreferences.appendLog(
+                    this@CollectorKeepAliveService,
+                    if (switchedBack) {
+                        "批次休息结束，已切换回百度地图"
+                    } else {
+                        "批次休息结束，切换回百度地图失败"
+                    },
+                )
+                updateNotification("批次休息结束，正在返回百度采集")
+            }
+            if (!currentCoroutineContext().isActive || !AppPreferences.isScanning(this@CollectorKeepAliveService)) break
+            updateNotification("正在同步服务端")
+            // 有任务时快速进入下一轮；没有任务时保留较长轮询间隔，降低服务端请求频率。
+            val nextSyncDelayMs = when (
+                val outcome = SyncManager(
+                    this@CollectorKeepAliveService,
+                    repository,
+                    engine,
+                ).runOnce()
+            ) {
+                is SyncOutcome.Completed -> {
+                    val message = "任务已完成，采集 ${outcome.stationCount} 个站点，等待下一条任务"
+                    AppPreferences.setRemoteStatus(this@CollectorKeepAliveService, message)
+                    updateNotification(message)
+                    showStepStatus(message)
+                    3_000L
+                }
+                is SyncOutcome.Skipped -> {
+                    val message = "任务已跳过：${outcome.stationName}"
+                    AppPreferences.setRemoteStatus(
+                        this@CollectorKeepAliveService,
+                        message,
+                        outcome.reason,
+                    )
+                    updateNotification("任务已跳过，等待下一条任务")
+                    showStepStatus(message)
+                    3_000L
+                }
+                is SyncOutcome.DetailRiskReleased -> {
+                    val message = "详情页风控，当前任务已释放，继续列表采集"
+                    AppPreferences.setRemoteStatus(
+                        this@CollectorKeepAliveService,
+                        "详情页风控，继续采集",
+                        outcome.message,
+                    )
+                    updateNotification(message)
+                    showStepStatus(message)
+                    8_000L
+                }
+                is SyncOutcome.HumanVerification -> {
+                    val message = "检测到人机验证，当前任务已释放，返回列表继续采集"
+                    AppPreferences.setRemoteStatus(
+                        this@CollectorKeepAliveService,
+                        "人机验证，继续采集",
+                        outcome.message,
+                    )
+                    updateNotification(message)
+                    showStepStatus(message)
+                    8_000L
+                }
+                is SyncOutcome.RecoveryPaused -> {
+                    restStatus("DeepSeek 恢复未完成，采集已暂停")
+                    AppPreferences.setRemoteStatus(this@CollectorKeepAliveService, "DeepSeek 恢复未完成，采集已暂停", outcome.message)
+                    AppPreferences.appendLog(this@CollectorKeepAliveService, outcome.message)
+                    break
+                }
+                is SyncOutcome.Failed -> {
+                    AppPreferences.setRemoteStatus(
+                        this@CollectorKeepAliveService,
+                        "同步失败",
+                        outcome.message,
+                    )
+                    updateNotification("同步失败，等待重试")
+                    showStepStatus("同步失败：${outcome.message}")
+                    8_000L
+                }
+                is SyncOutcome.NoTask -> {
+                    val message = "当前暂无待领取任务，正在等待新任务"
+                    AppPreferences.setRemoteStatus(
+                        this@CollectorKeepAliveService,
+                        "等待任务",
+                        message,
+                    )
+                    updateNotification("等待任务")
+                    showStepStatus(message)
+                    15_000L
+                }
+            }
+            delay(nextSyncDelayMs)
         }
     }
 
@@ -251,7 +413,7 @@ class CollectorKeepAliveService : Service() {
                     if (control.stopRequired || !control.releaseComplete) {
                         engine?.stop()
                         FleetControlClient.stopAndAcknowledge(this@CollectorKeepAliveService, api, control.stopGeneration)
-                        loopJob?.cancelAndJoin()
+                        cycleJob?.cancelAndJoin()
                         stopSelf()
                         return@launch
                     }

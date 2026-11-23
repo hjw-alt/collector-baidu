@@ -3,18 +3,90 @@ package com.tigercode.evcollector.accessibility
 import android.graphics.Bitmap
 import com.tigercode.evcollector.core.model.NodeSnapshot
 import com.tigercode.evcollector.core.model.Rect
+import com.tigercode.evcollector.core.parser.BaiduCouponSheetDetector
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
-/** Only coupon promotions qualify: neither a search clear icon nor a price-sheet close. */
+/** Only recognised Baidu dialogs, detail sheets and coupon promotions qualify. */
 internal object BaiduPromotionDetector {
-    data class CloseTarget(val bounds: Rect, val evidence: String, val visual: Boolean)
-    data class Observation(val target: CloseTarget?, val imageChecked: Boolean = false)
+    enum class CloseAction { TAP_BOUNDS, CANCEL_PLACE_NAME, CLOSE_IMAGE_CARD }
+    data class CloseTarget(
+        val bounds: Rect,
+        val evidence: String,
+        val visual: Boolean,
+        val action: CloseAction = CloseAction.TAP_BOUNDS,
+    )
+    data class Observation(
+        val target: CloseTarget?,
+        val imageChecked: Boolean = false,
+        val blockingImageCard: Boolean = false,
+    )
 
-    fun fromNodes(snapshot: NodeSnapshot, width: Int, height: Int): CloseTarget? {
+    private const val UPDATE_PANEL = "com.baidu.BaiduMap:id/customPanel"
+    private const val UPDATE_ACTION = "com.baidu.BaiduMap:id/direct_update"
+    private const val UPDATE_CANCEL = "com.baidu.BaiduMap:id/cancel_update"
+    private const val COMMON_POPUP = "com.baidu.BaiduMap:id/commonPopupContainer"
+    private const val FRAME = "android.widget.FrameLayout"
+    private const val COLUMN = "android.widget.LinearLayout"
+    private const val IMAGE = "android.widget.ImageView"
+
+    private fun descendants(root: NodeSnapshot): List<NodeSnapshot> = buildList {
+        fun walk(node: NodeSnapshot) {
+            add(node)
+            node.children.forEach(::walk)
+        }
+        walk(root)
+    }
+
+    private fun updatePanel(snapshot: NodeSnapshot): NodeSnapshot? = descendants(snapshot)
+        .filter { it.viewId == "com.baidu.BaiduMap:id/parentPanel" }
+        .flatMap(::descendants)
+        .firstOrNull { panel ->
+            panel.viewId == UPDATE_PANEL && panel.enabled && panel.bounds.isValid &&
+                descendants(panel).any {
+                    it.viewId == UPDATE_ACTION && it.enabled && it.clickable && it.bounds.isValid
+                }
+        }
+
+    fun isUpdateDialogVisible(snapshot: NodeSnapshot): Boolean = updatePanel(snapshot) != null
+
+    fun fromNodes(snapshot: NodeSnapshot, width: Int, height: Int): CloseTarget? =
+        observeNodes(snapshot, width, height).target
+
+    fun observeNodes(snapshot: NodeSnapshot, width: Int, height: Int): Observation {
+        val update = updatePanel(snapshot)
+        if (update != null) return Observation(nativeDialogTarget(snapshot, width, height, update))
+        return observeImageCard(snapshot, width, height) ?: Observation(nativeDialogTarget(snapshot, width, height, null))
+    }
+
+    private fun nativeDialogTarget(snapshot: NodeSnapshot, width: Int, height: Int, updatePanel: NodeSnapshot?): CloseTarget? {
+        if (updatePanel != null) {
+            val closes = descendants(updatePanel).filter { node ->
+                val b = node.bounds
+                val panel = updatePanel.bounds
+                node.viewId == UPDATE_CANCEL && node.enabled && node.clickable && b.isValid &&
+                    b.left >= 0 && b.top >= 0 && b.right <= width && b.bottom <= height &&
+                    b.left >= panel.left && b.top >= panel.top &&
+                    b.right <= panel.right && b.bottom <= panel.bottom &&
+                    b.width in 16..(width * 0.20).toInt() && b.height in 16..(width * 0.20).toInt() &&
+                    abs(b.width - b.height) <= maxOf(b.width, b.height) * 0.35
+            }
+            // Never fall through to visual/coupon heuristics inside a native update dialog.
+            return closes.singleOrNull()?.let {
+                CloseTarget(it.bounds, "百度版本更新弹窗 cancel_update 关闭控件", visual = false)
+            }
+        }
+        if (BaiduPlaceNameSheetDetector.isVisible(snapshot, width, height)) {
+            val sheet = BaiduPlaceNameSheetDetector.cancelableSheet(snapshot, width, height) ?: return null
+            return CloseTarget(sheet.cancel.bounds, "地点名称菜单：复制地点名称／取消", visual = false,
+                action = CloseAction.CANCEL_PLACE_NAME)
+        }
+        BaiduCouponSheetDetector.closeBounds(snapshot, width, height)?.let {
+            return CloseTarget(it, "充电优惠券套餐及右上角关闭控件", visual = false)
+        }
         val nodes = mutableListOf<NodeSnapshot>()
         fun walk(node: NodeSnapshot) {
             nodes.add(node)
@@ -183,4 +255,68 @@ internal object BaiduPromotionDetector {
             if (image !== source) image.recycle()
         }
     }
+
+    /** The captured fuel-coupon card has a separate footer image below its clickable ad body. */
+    private fun observeImageCard(snapshot: NodeSnapshot, width: Int, height: Int): Observation? {
+        if (width <= 0 || height <= width) return null
+        val host = descendants(snapshot).singleOrNull {
+            it.viewId == COMMON_POPUP && it.className == FRAME && it.enabled &&
+                it.bounds.left == 0 && it.bounds.top == 0 && it.bounds.right == width &&
+                it.bounds.bottom in (height * 0.85).toInt()..height
+        } ?: return null
+        val overlay = host.children.singleOrNull()?.takeIf {
+            it.className == FRAME && it.clickable && it.enabled && it.bounds == host.bounds
+        } ?: return null
+
+        val layouts = descendants(overlay).mapNotNull { column ->
+            val card = column.children.firstOrNull() ?: return@mapNotNull null
+            val b = card.bounds
+            if (column.className != COLUMN || !column.enabled || column.bounds.left != host.bounds.left ||
+                column.bounds.right != host.bounds.right || column.bounds.top != b.top ||
+                !column.bounds.contains(b) || card.className != FRAME || !card.enabled ||
+                b.width !in (width * 0.55).toInt()..(width * 0.88).toInt() ||
+                b.height !in (height * 0.28).toInt()..(height * 0.60).toInt() ||
+                b.top !in (height * 0.08).toInt()..(height * 0.40).toInt() ||
+                abs(b.centerX - host.bounds.centerX) > width * 0.04
+            ) return@mapNotNull null
+
+            // The ad image and its CTA are siblings inside the card. Neither may be clicked as a close target.
+            val ad = descendants(card).singleOrNull { frame ->
+                frame.className == FRAME && frame.bounds == b && frame.children.size == 2 &&
+                    frame.children[0].let { it.anonymousImage() && it.bounds == b } &&
+                    frame.children[1].let { cta ->
+                        cta.className == FRAME && cta.enabled && cta.clickable && b.contains(cta.bounds) &&
+                            cta.bounds.width >= b.width * 0.65 && cta.bounds.height in 1..(b.height * 0.22).toInt() &&
+                            cta.bounds.top >= b.top + b.height * 0.65 &&
+                            cta.children.singleOrNull()?.let {
+                                it.className == IMAGE && !it.clickable && it.bounds == cta.bounds
+                            } == true
+                    }
+            } ?: return@mapNotNull null
+            column to ad.bounds
+        }
+        if (layouts.isEmpty()) return null
+        val (column, card) = layouts.singleOrNull() ?: return Observation(null, blockingImageCard = true)
+        val footer = column.children.drop(1).singleOrNull()?.takeIf {
+            it.className == FRAME && it.enabled && !it.clickable && column.bounds.contains(it.bounds) &&
+                it.bounds.left == column.bounds.left && it.bounds.right == column.bounds.right &&
+                it.bounds.top - card.bottom in 0..(width * 0.18).toInt()
+        }
+        val close = footer?.children?.singleOrNull()?.takeIf { button ->
+            val b = button.bounds
+            button.anonymousImage() && footer.bounds.contains(b) &&
+                b.width in (width * 0.04).toInt()..(width * 0.13).toInt() &&
+                b.height in (width * 0.04).toInt()..(width * 0.13).toInt() &&
+                abs(b.width - b.height) <= b.width * 0.25 && abs(b.centerX - card.centerX) <= width * 0.04
+        }
+        return Observation(close?.let {
+            CloseTarget(it.bounds, "百度图片促销广告：卡片下方关闭按钮", visual = false, action = CloseAction.CLOSE_IMAGE_CARD)
+        }, blockingImageCard = true)
+    }
+
+    private fun NodeSnapshot.anonymousImage(): Boolean = className == IMAGE && enabled && clickable &&
+        viewId.isEmpty() && text.isBlank() && contentDescription.isBlank() && children.isEmpty()
+
+    private fun Rect.contains(other: Rect): Boolean = other.isValid &&
+        other.left >= left && other.top >= top && other.right <= right && other.bottom <= bottom
 }

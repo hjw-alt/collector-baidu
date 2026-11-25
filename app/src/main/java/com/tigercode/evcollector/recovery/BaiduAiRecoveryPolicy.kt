@@ -133,6 +133,10 @@ internal object BaiduAiRecoveryPolicy {
     private fun labels(root: NodeSnapshot): List<String> = nodes(root).flatMap { sequenceOf(it.text, it.contentDescription) }
         .map { it.trim().lowercase().replace(whitespace, "") }.filter { it.isNotEmpty() }.toList()
 
+    fun canApplyAction(expected: AiRecoveryScene, fresh: AiRecoveryScene, action: RecoveryAction): Boolean =
+        expected.windowId == fresh.windowId && !isProtected(fresh.snapshot) && !isHome(fresh.snapshot) &&
+            (action == RecoveryAction.BACK || expected == fresh)
+
     fun closeTarget(root: NodeSnapshot): NodeSnapshot? = nodes(root).filter { node ->
         node.enabled && node.clickable && node.bounds.isValid &&
             node.bounds.left >= root.bounds.left && node.bounds.top >= root.bounds.top &&

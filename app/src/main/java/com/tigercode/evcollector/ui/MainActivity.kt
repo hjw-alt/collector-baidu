@@ -37,6 +37,8 @@ import com.tigercode.evcollector.network.FleetStopRequest
 import com.tigercode.evcollector.network.SyncManager
 import com.tigercode.evcollector.network.SyncOutcome
 import com.tigercode.evcollector.recovery.DeepSeekKeyStore
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -56,6 +58,10 @@ class MainActivity : AppCompatActivity() {
             refreshHandler.postDelayed(this, 2000)
         }
     }
+
+    private var startJob: Job? = null
+    private var syncJob: Job? = null
+    private var localFleetWatchJob: Job? = null
 
     private var localPending = 0
     private var localDone = 0
@@ -84,6 +90,13 @@ class MainActivity : AppCompatActivity() {
             SyncManager(this, repository, engine).uploadLocalResultsOnly()
         }
         engine.addListener(engineListener)
+        com.tigercode.evcollector.network.DeviceCommandClient.attachActivity(this) {
+            engine.stop()
+            startJob?.cancelAndJoin()
+            syncJob?.cancelAndJoin()
+            localFleetWatchJob?.cancelAndJoin()
+            engine.stopAndReleaseLocalTask()
+        }
 
         binding.serverUrlInput.setText(AppPreferences.serverUrl(this))
         binding.activationCodeInput.setText(AppPreferences.activationCode(this))
@@ -147,6 +160,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        com.tigercode.evcollector.network.DeviceCommandClient.detachActivity(this)
         refreshHandler.removeCallbacks(refreshRunnable)
         engine.removeListener(engineListener)
         engine.stop()
@@ -252,7 +266,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (!saveConfig()) return
         fleetStartInProgress = true
-        lifecycleScope.launch {
+        startJob = lifecycleScope.launch {
             try {
                 FleetControlClient.resumeManually(this@MainActivity)
                 action()
@@ -324,7 +338,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun syncNow() {
         if (!saveConfig()) return
-        lifecycleScope.launch {
+        if (syncJob?.isActive == true) return
+        syncJob = lifecycleScope.launch {
             AppPreferences.setRemoteStatus(this@MainActivity, "正在同步")
             refreshUi()
             engine.awaitReadyForNextTask()
@@ -594,7 +609,8 @@ class MainActivity : AppCompatActivity() {
         val district = binding.districtInput.text?.toString()?.trim().orEmpty()
         val keyword = binding.keywordInput.text?.toString()?.trim().orEmpty()
         engine.startLocal(city, district, keyword, engineListener)
-        lifecycleScope.launch {
+        localFleetWatchJob?.cancel()
+        localFleetWatchJob = lifecycleScope.launch {
             val api = FleetControlClient.api(this@MainActivity)
             do {
                 delay(3_000L)

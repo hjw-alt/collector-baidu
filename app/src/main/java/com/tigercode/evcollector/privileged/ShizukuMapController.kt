@@ -45,9 +45,19 @@ object ShizukuMapController {
         }
     }.getOrDefault(Availability.STOPPED)
 
-    /** Must be entered on main; only IPC/commands move to IO. No collector/task state is changed. */
+    /** Manual/work-rest calls must still refuse to interrupt an active collector. */
     suspend fun forceStopMap(context: Context, collectionIsActive: () -> Boolean): StopResult =
-        withContext(Dispatchers.Main.immediate) {
+        forceStopMapWhenAllowed(context, { !collectionIsActive() }, "本机正在采集或准备采集，请先停止本机采集")
+
+    /** Recovery runs inside an active task, with its own revocable ownership check. */
+    internal suspend fun forceStopMapForRecovery(context: Context, recoveryIsActive: () -> Boolean): StopResult =
+        forceStopMapWhenAllowed(context, recoveryIsActive, "恢复已取消或前台页面已变更，本次关闭已取消")
+
+    private suspend fun forceStopMapWhenAllowed(
+        context: Context,
+        mayStop: () -> Boolean,
+        rejectedMessage: String,
+    ): StopResult = withContext(Dispatchers.Main.immediate) {
             if (!busy.compareAndSet(false, true)) return@withContext StopResult(false, "正在关闭地图，请稍候")
             val args = Shizuku.UserServiceArgs(ComponentName(context, MapControlUserService::class.java))
                 .daemon(false)
@@ -56,7 +66,7 @@ object ShizukuMapController {
                 .version(BuildConfig.VERSION_CODE)
             var connection: ServiceConnection? = null
             try {
-                check(!collectionIsActive()) { "本机正在采集或准备采集，请先停止本机采集" }
+                check(mayStop()) { rejectedMessage }
                 check(availability(context) == Availability.READY) { "请先启动 Shizuku 并授权采集 App" }
                 val service = withTimeout(12_000L) {
                     suspendCancellableCoroutine<IMapControlService> { continuation ->
@@ -81,7 +91,7 @@ object ShizukuMapController {
                     }
                 }
                 // Collection may have changed while waiting for the privileged service.
-                check(!collectionIsActive()) { "本机已开始采集，本次关闭已取消" }
+                check(mayStop()) { rejectedMessage }
                 check(availability(context) == Availability.READY) { "Shizuku 授权或连接已失效" }
                 val reply = withContext(Dispatchers.IO) { service.forceStopMap() }
                 check(reply.getString("package") == target.packageName) { "关闭目标校验失败" }

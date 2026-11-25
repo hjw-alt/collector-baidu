@@ -12,8 +12,8 @@ android {
         applicationId = "com.tigercode.bdcollector"
         minSdk = 26
         targetSdk = 35
-        versionCode = 72
-        versionName = "0.1.71"
+        versionCode = 76
+        versionName = "0.1.75"
     }
 
     buildTypes {

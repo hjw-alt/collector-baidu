@@ -42,6 +42,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import retrofit2.HttpException
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
 class CollectorKeepAliveService : Service() {
     // MIUI/HyperOS 可能在息屏/切后台时压制主线程调度。调度循环使用工作线程，
@@ -50,12 +55,15 @@ class CollectorKeepAliveService : Service() {
     private var loopJob: Job? = null
     private var cycleJob: Job? = null
     private var restAlarmDeadline = 0L
+    private var lastRestWaitLog = ""
+    private var lastRestWaitLogAt = 0L
     private var fleetWatchJob: Job? = null
     private var engine: CollectionEngine? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
+        remoteInstance = this
         createNotificationChannel()
         acquireKeepAliveLock()
         startAsForeground("采集服务正在启动")
@@ -89,6 +97,7 @@ class CollectorKeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        if (remoteInstance === this) remoteInstance = null
         cycleJob?.cancel()
         engine?.stop()
         loopJob?.cancel()
@@ -137,13 +146,40 @@ class CollectorKeepAliveService : Service() {
 
     private fun saveCycle(state: BaiduWorkRestState) = AppPreferences.saveBaiduWorkRestState(this, state)
 
-    private fun restStatus(message: String) {
-        AppPreferences.setRemoteStatus(this, message)
-        updateNotification(message)
+    private fun restStatus(message: String, error: String = "") {
+        AppPreferences.setRemoteStatus(this, message, error)
+        updateNotification(if (error.isBlank()) message else "$message：$error")
+    }
+
+    private fun restWaitStatus(message: String, error: String = "") {
+        restStatus(message, error)
+        val detail = if (error.isBlank()) message else "$message：$error"
+        val now = SystemClock.elapsedRealtime()
+        // Keep failures visible without evicting the useful history on every five-second retry.
+        if (detail != lastRestWaitLog || now - lastRestWaitLogAt >= 60_000L) {
+            AppPreferences.appendLog(this, "$detail；5秒后自动重试")
+            lastRestWaitLog = detail
+            lastRestWaitLogAt = now
+        }
+    }
+
+    private fun recoveryFailureReason(error: Exception): String = when (error) {
+        is HttpException -> if (error.code() == 401 || error.code() == 403) {
+            "设备认证未通过（HTTP ${error.code()}），下次将重新认证"
+        } else {
+            "服务器请求失败（HTTP ${error.code()}）"
+        }
+        is SocketTimeoutException -> "连接服务器超时"
+        is UnknownHostException -> "无法解析服务器地址"
+        is ConnectException -> "无法连接采集服务器"
+        is IOException -> "网络连接异常"
+        is IllegalStateException -> error.message.orEmpty().take(160).ifBlank { "恢复状态检查未通过" }
+        else -> "恢复检查异常（${error.javaClass.simpleName}）"
     }
 
     private suspend fun runWorkRestCycle(repository: CollectorRepository, engine: CollectionEngine) {
         val bootCount = Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, 0)
+        var reopenAttempts = 0
         while (currentCoroutineContext().isActive && collectionEnabled()) {
             val now = SystemClock.elapsedRealtime()
             val saved = AppPreferences.baiduWorkRestState(this)
@@ -158,7 +194,7 @@ class CollectorKeepAliveService : Service() {
                     }
                     // Recover a lease left by a killed process before claiming any new station.
                     if (!TaskLeaseReleaseClient.releasePending(this)) {
-                        updateNotification("等待归还中断任务，暂不领取新站点")
+                        restWaitStatus("等待归还中断任务，暂不领取新站点", AppPreferences.remoteError(this))
                         delay(5_000L)
                         continue
                     }
@@ -179,7 +215,7 @@ class CollectorKeepAliveService : Service() {
                 BaiduRestPhase.STOPPING -> {
                     engine.stopAndReleaseLocalTask()
                     if (!TaskLeaseReleaseClient.releasePending(this)) {
-                        updateNotification("自动休息：任务尚未释放，等待重试")
+                        restWaitStatus("自动休息：任务尚未释放，等待重试", AppPreferences.remoteError(this))
                         delay(5_000L)
                         continue
                     }
@@ -191,14 +227,14 @@ class CollectorKeepAliveService : Service() {
                     }
                     if (!collectionEnabled()) break
                     if (!result.success) {
-                        restStatus("自动休息：${result.message}；保持暂停，5秒后重试")
+                        restWaitStatus("自动休息：关闭百度地图未完成", result.message)
                         delay(5_000L)
                         continue
                     }
                     val switched = ChargingAccessibilityService.current()?.launchCollectorApp() == true
                     if (!collectionEnabled()) break
                     if (!switched) {
-                        restStatus("百度后台已关闭，等待无障碍服务返回采集App")
+                        restWaitStatus("百度后台已关闭，等待无障碍服务返回采集App")
                         delay(5_000L)
                         continue
                     }
@@ -222,30 +258,54 @@ class CollectorKeepAliveService : Service() {
                 BaiduRestPhase.REOPENING -> {
                     CooldownAlarmScheduler.cancel(this)
                     restAlarmDeadline = 0L
+                    if (reopenAttempts == 0) {
+                        AppPreferences.appendLog(this, "5分钟休息已结束，开始自动恢复：归还任务、检查服务器权限、打开百度地图")
+                    }
+                    reopenAttempts++
+                    restStatus("休息已结束，正在自动恢复（第${reopenAttempts}次）")
                     if (!TaskLeaseReleaseClient.releasePending(this)) {
+                        restWaitStatus("自动恢复：等待归还中断任务", AppPreferences.remoteError(this))
                         delay(5_000L)
                         continue
                     }
+                    if (!collectionEnabled()) break
                     try {
-                        // A fleet-wide stop during the break must never be bypassed by auto-resume.
+                        // Authentication repair must never bypass a fleet-wide stop during the break.
                         FleetControlClient.requireAllowed(this, FleetControlClient.api(this))
                     } catch (error: CancellationException) {
                         throw error
-                    } catch (_: Exception) {
-                        restStatus("休息已结束，等待服务器确认允许继续采集")
+                    } catch (error: Exception) {
+                        if (!collectionEnabled()) break
+                        restWaitStatus("自动恢复：等待服务器确认允许继续采集", recoveryFailureReason(error))
                         delay(5_000L)
                         continue
                     }
                     if (!collectionEnabled()) break
-                    val opened = !ShizukuMapController.isBusy &&
-                        ChargingAccessibilityService.current()?.launchAmap() == true
+                    val opened = try {
+                        !ShizukuMapController.isBusy &&
+                            ChargingAccessibilityService.current()?.launchAmap() == true
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        if (!collectionEnabled()) break
+                        restWaitStatus("自动恢复：打开百度地图失败", recoveryFailureReason(error))
+                        delay(5_000L)
+                        continue
+                    }
                     if (!collectionEnabled()) break
                     if (!opened) {
-                        restStatus("休息已结束，等待无障碍服务重新打开百度地图")
+                        val reason = when {
+                            ShizukuMapController.isBusy -> "正在等待Shizuku操作结束"
+                            ChargingAccessibilityService.current() == null -> "无障碍服务未连接"
+                            else -> "启动百度地图未成功"
+                        }
+                        restWaitStatus("自动恢复：等待重新打开百度地图", reason)
                         delay(5_000L)
                         continue
                     }
                     saveCycle(BaiduWorkRestPolicy.collecting(SystemClock.elapsedRealtime(), bootCount))
+                    reopenAttempts = 0
+                    lastRestWaitLog = ""
                     AppPreferences.appendLog(this, "5分钟休息结束，百度地图已打开，开始下一段2小时采集")
                     restStatus("休息结束，继续百度采集")
                 }
@@ -488,6 +548,22 @@ class CollectorKeepAliveService : Service() {
     }
 
     companion object {
+        @Volatile private var remoteInstance: CollectorKeepAliveService? = null
+
+        fun isCollectingServiceRunning(): Boolean = remoteInstance?.cycleJob?.isActive == true
+
+        suspend fun stopForRemote(context: Context) {
+            val active = remoteInstance ?: return
+            active.engine?.stop()
+            active.fleetWatchJob?.cancelAndJoin()
+            active.cycleJob?.cancelAndJoin()
+            active.loopJob?.cancelAndJoin()
+            active.stopSelf()
+            kotlinx.coroutines.withTimeout(5_000L) {
+                while (remoteInstance === active) delay(25L)
+            }
+        }
+
         private const val CHANNEL_ID = "collector_foreground"
         private const val NOTIFICATION_ID = 1001
         private const val ACTION_STOP = "com.tigercode.evcollector.STOP_COLLECTOR"

@@ -223,10 +223,10 @@ object AppPreferences {
             .orEmpty()
 
     fun saveDeviceToken(context: Context, token: String) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        check(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_DEVICE_TOKEN, token.trim())
-            .apply()
+            .commit()) { "无法保存设备认证，请检查手机存储空间" }
     }
 
     fun pacingDetailEntryTimes(

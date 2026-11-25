@@ -133,12 +133,29 @@ data class HenanTaskResetResponse(
     @SerializedName("statusCounts") val statusCounts: Map<String, Int> = emptyMap(),
 )
 
+data class DeviceCommandDto(
+    @SerializedName("commandId") val commandId: Long,
+    @SerializedName("action") val action: String,
+    @SerializedName("mode") val mode: String,
+    @SerializedName("status") val status: String,
+    @SerializedName("stopGeneration") val stopGeneration: Long,
+    @SerializedName("releaseComplete") val releaseComplete: Boolean = false,
+)
+
+data class DeviceCommandAckRequest(
+    @SerializedName("commandId") val commandId: Long,
+    @SerializedName("status") val status: String,
+    @SerializedName("error") val error: String = "",
+)
+
 data class FleetControlDto(
     @SerializedName("supported") val supported: Boolean = false,
     @SerializedName("stopGeneration") val stopGeneration: Long = 0,
     @SerializedName("stopRequired") val stopRequired: Boolean = false,
     @SerializedName("releaseComplete") val releaseComplete: Boolean = false,
     @SerializedName("canStopAll") val canStopAll: Boolean = false,
+    @SerializedName("fleetStopRequired") val fleetStopRequired: Boolean = false,
+    @SerializedName("deviceCommand") val deviceCommand: DeviceCommandDto? = null,
 )
 
 data class DeviceConfigResponse(
@@ -158,7 +175,25 @@ data class FleetStopResponse(
     @SerializedName("deviceCount") val deviceCount: Int = 0,
 )
 
+data class RecoveryEventRequest(
+    @SerializedName("invocationId") val invocationId: String,
+    @SerializedName("stage") val stage: String,
+    @SerializedName("cause") val cause: String,
+    @SerializedName("outcome") val outcome: String,
+    @SerializedName("modelStatus") val modelStatus: String = "PENDING",
+    @SerializedName("action") val action: String? = null,
+    @SerializedName("modelMs") val modelMs: Long? = null,
+    @SerializedName("httpStatus") val httpStatus: Int? = null,
+    @SerializedName("appliedActions") val appliedActions: Int = 0,
+)
+
 interface ServerApi {
+    @POST("api/v1/devices/me/command-result")
+    suspend fun acknowledgeDeviceCommand(@Body body: DeviceCommandAckRequest): Map<String, Any>
+
+    @POST("api/v1/collector-monitor/recovery-events")
+    suspend fun reportRecoveryEvent(@Body body: RecoveryEventRequest): Unit
+
     @GET("api/v1/devices/me/config")
     suspend fun deviceConfig(): DeviceConfigResponse
 

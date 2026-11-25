@@ -18,11 +18,14 @@ object TaskLeaseReleaseClient {
         val lease = AppPreferences.activeRemoteLease(context) ?: return true
         val source = if (reasonCode == "AI_RECOVERY_PAUSED") "DeepSeek 恢复暂停" else "自动休息"
         try {
-            val response = RetrofitClient.serverApi(AppPreferences.serverUrl(context), context, controlPlane = true).releaseTask(
-                lease.taskId,
-                TaskActionRequest(deviceCode = lease.deviceCode, mode = lease.mode, leaseToken = lease.leaseToken,
-                    errorCode = reasonCode, errorMessage = reasonMessage),
-            )
+            val api = RetrofitClient.serverApi(AppPreferences.serverUrl(context), context, controlPlane = true)
+            val response = DeviceRegistrationClient.authenticated(context) {
+                api.releaseTask(
+                    lease.taskId,
+                    TaskActionRequest(deviceCode = lease.deviceCode, mode = lease.mode, leaseToken = lease.leaseToken,
+                        errorCode = reasonCode, errorMessage = reasonMessage),
+                )
+            }
             val task = response["task"] as? Map<*, *>
             check(response["released"] == true && task?.get("id") == lease.taskId && task["leaseToken"] == "") {
                 "服务端未确认当前租约已释放"

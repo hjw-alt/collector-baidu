@@ -6,6 +6,7 @@ import android.app.KeyguardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
@@ -41,6 +42,8 @@ import com.tigercode.evcollector.recovery.BaiduAiRecoveryPolicy
 import com.tigercode.evcollector.recovery.RecoveryAction
 
 class ChargingAccessibilityService : AccessibilityService() {
+    private val commandScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
+    private var commandJob: kotlinx.coroutines.Job? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
@@ -99,6 +102,8 @@ class ChargingAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        commandJob?.cancel()
+        commandJob = com.tigercode.evcollector.network.DeviceCommandClient.watch(this, commandScope)
         Log.i("EvCollector", "采集助手无障碍服务已连接")
         refreshSnapshot()
     }
@@ -114,6 +119,7 @@ class ChargingAccessibilityService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        commandJob?.cancel()
         CollectionStatusNotifier.clear()
         mainHandler.removeCallbacks(snapshotRefreshRunnable)
         snapshotRefreshPending = false
@@ -124,6 +130,8 @@ class ChargingAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        commandJob?.cancel()
+        commandScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
         CollectionStatusNotifier.clear()
         mainHandler.removeCallbacks(snapshotRefreshRunnable)
         snapshotRefreshPending = false
@@ -145,14 +153,24 @@ class ChargingAccessibilityService : AccessibilityService() {
     }
 
     /** AI has no permission to use the regular MIUI window fallback. */
-    private fun <T> withAiRecoveryRoot(block: (AccessibilityNodeInfo) -> T?): T? {
+    private fun <T> withAiRecoveryRoot(block: (AccessibilityNodeInfo) -> T?): T? =
+        withRecoveryRoot(allowLauncher = false, block)
+
+    private fun <T> withRecoveryRoot(allowLauncher: Boolean, block: (AccessibilityNodeInfo) -> T?): T? {
         if (getSystemService(PowerManager::class.java)?.isInteractive != true ||
             getSystemService(KeyguardManager::class.java)?.isKeyguardLocked != false) return null
         val currentWindows = windows
         return try {
             val root = rootInActiveWindow ?: return null
             try {
-                if (root.packageName?.toString() != AMAP_PACKAGE) return null
+                val foreground = root.packageName?.toString() ?: return null
+                if (foreground != AMAP_PACKAGE) {
+                    if (!allowLauncher) return null
+                    val launcher = packageManager.resolveActivity(
+                        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), PackageManager.MATCH_DEFAULT_ONLY,
+                    )?.activityInfo?.packageName
+                    if (foreground != launcher) return null
+                }
                 val active = currentWindows.singleOrNull { it.id == root.windowId && it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
                     ?: return null
                 val obscured = currentWindows.any { window ->
@@ -174,6 +192,11 @@ class ChargingAccessibilityService : AccessibilityService() {
         AiRecoveryScene(root.windowId, NodeSnapshotReader.toSnapshot(root))
     }
 
+    internal fun canRestartBaiduForRecovery(): Boolean = withRecoveryRoot(allowLauncher = true) { root ->
+        root.packageName?.toString() != AMAP_PACKAGE ||
+            !BaiduAiRecoveryPolicy.isProtected(NodeSnapshotReader.toSnapshot(root))
+    } ?: false
+
     internal fun applyAiRecoveryAction(
         expected: AiRecoveryScene,
         action: RecoveryAction,
@@ -183,8 +206,8 @@ class ChargingAccessibilityService : AccessibilityService() {
         withAiRecoveryRoot { root ->
             val snapshot = NodeSnapshotReader.toSnapshot(root)
             val fresh = AiRecoveryScene(root.windowId, snapshot)
-            if (expected != fresh || BaiduAiRecoveryPolicy.isProtected(snapshot) ||
-                BaiduAiRecoveryPolicy.isHome(snapshot) || !canOperate()) return@withAiRecoveryRoot false
+            if (!BaiduAiRecoveryPolicy.canApplyAction(expected, fresh, action) ||
+                !canOperate()) return@withAiRecoveryRoot false
             when (action) {
                 RecoveryAction.BACK -> performGlobalAction(GLOBAL_ACTION_BACK)
                 RecoveryAction.CLOSE_OVERLAY -> BaiduAiRecoveryPolicy.closeTarget(snapshot)

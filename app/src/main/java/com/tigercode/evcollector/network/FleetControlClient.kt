@@ -4,14 +4,27 @@ import android.content.Context
 import android.os.Build
 import com.tigercode.evcollector.AppPreferences
 import com.tigercode.evcollector.CollectionStatusNotifier
-import com.tigercode.evcollector.CollectorVersions
 import com.tigercode.evcollector.CooldownAlarmScheduler
 import com.tigercode.evcollector.accessibility.ChargingAccessibilityService
+import com.tigercode.evcollector.recovery.DeepSeekKeyStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import retrofit2.HttpException
+
+internal fun collectorCapabilities(context: Context): Map<String, Any> = mapOf(
+    "accessibilityConnected" to ChargingAccessibilityService.isConnected(),
+    "targetPackage" to ChargingAccessibilityService.AMAP_PACKAGE,
+    "sdkInt" to Build.VERSION.SDK_INT,
+    "manufacturer" to Build.MANUFACTURER,
+    "model" to Build.MODEL,
+    "fleetStopSupported" to true,
+    "remoteDeviceControl" to 1,
+    "collectionRunning" to AppPreferences.isScanning(context),
+    "collectionMode" to if (!AppPreferences.isLocalQueueMode(context) && !AppPreferences.isMonitorMode(context)) "DEVICE_DISPATCH" else "OTHER",
+    "deepSeekRecoveryTelemetry" to true,
+    "deepSeekRecoveryEnabled" to DeepSeekKeyStore.isConfigured(context),
+)
 
 class FleetStoppedException : CancellationException("收到全部停止指令")
 
@@ -19,35 +32,12 @@ object FleetControlClient {
     fun api(context: Context): ServerApi =
         RetrofitClient.serverApi(AppPreferences.serverUrl(context), context, controlPlane = true)
 
-    private suspend fun register(context: Context, api: ServerApi) {
-        val response = api.register(DeviceRegisterRequest(
-            activationCode = AppPreferences.activationCode(context),
-            deviceCode = AppPreferences.deviceCode(context),
-            name = Build.MODEL,
-            appVersion = CollectorVersions.APP_VERSION,
-            parserVersion = CollectorVersions.PARSER_VERSION,
-            targetAppVersion = "",
-            capabilities = mapOf(
-                "accessibilityConnected" to ChargingAccessibilityService.isConnected(),
-                "targetPackage" to ChargingAccessibilityService.AMAP_PACKAGE,
-                "model" to Build.MODEL,
-                "fleetStopSupported" to true,
-            ),
-        ))
-        check(response.deviceToken.isNotBlank()) { "设备注册未返回令牌" }
-        AppPreferences.saveDeviceToken(context, response.deviceToken)
-    }
-
-    suspend fun control(context: Context, api: ServerApi, allowRegistration: Boolean = false): FleetControlDto {
-        if (AppPreferences.deviceToken(context).isBlank()) {
-            check(allowRegistration) { "等待设备注册" }
-            register(context, api)
-        }
-        val response = try {
-            api.deviceConfig()
-        } catch (error: HttpException) {
-            if (!allowRegistration || (error.code() != 401 && error.code() != 403)) throw error
-            register(context, api)
+    // Refreshing authentication never resumes a stopped device; only resumeManually does that.
+    suspend fun control(context: Context, api: ServerApi, allowRegistration: Boolean = true): FleetControlDto {
+        val response = if (allowRegistration) {
+            DeviceRegistrationClient.authenticated(context) { api.deviceConfig() }
+        } else {
+            check(AppPreferences.deviceToken(context).isNotBlank()) { "等待设备注册" }
             api.deviceConfig()
         }
         val control = response.fleetControl
@@ -66,7 +56,7 @@ object FleetControlClient {
     fun markStopped(context: Context) {
         AppPreferences.setScanning(context, false)
         CooldownAlarmScheduler.cancel(context)
-        val message = "收到全部停止指令，本机已停止；任务由服务器释放，需手动开始"
+        val message = "收到服务端停采指令，本机已停止；可在监控台或手机上重新开始"
         AppPreferences.setRemoteStatus(context, message)
         AppPreferences.appendLog(context, message)
         CollectionStatusNotifier.show(context, message)
@@ -89,9 +79,14 @@ object FleetControlClient {
 
     suspend fun requireAllowed(context: Context, api: ServerApi) {
         val control = control(context, api)
-        if (control.stopRequired || !control.releaseComplete) {
-            stopAndAcknowledge(context, api, control.stopGeneration)
-            throw FleetStoppedException()
-        }
+        enforceFleetPermission(control) { generation -> stopAndAcknowledge(context, api, generation) }
+    }
+}
+
+/** Authentication refresh must still pass the fleet stop/release gate before opening the map. */
+internal suspend fun enforceFleetPermission(control: FleetControlDto, stop: suspend (Long) -> Unit) {
+    if (control.stopRequired || !control.releaseComplete) {
+        stop(control.stopGeneration)
+        throw FleetStoppedException()
     }
 }

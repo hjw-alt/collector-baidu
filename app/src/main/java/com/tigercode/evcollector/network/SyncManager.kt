@@ -1,12 +1,10 @@
 package com.tigercode.evcollector.network
 
 import android.content.Context
-import android.os.Build
 import com.google.gson.JsonParser
 import com.tigercode.evcollector.AppPreferences
 import com.tigercode.evcollector.CollectorVersions
 import com.tigercode.evcollector.CollectionStatusNotifier
-import com.tigercode.evcollector.accessibility.ChargingAccessibilityService
 import com.tigercode.evcollector.core.model.StationDetail
 import com.tigercode.evcollector.data.CollectorRepository
 import com.tigercode.evcollector.engine.CollectionEngine
@@ -49,7 +47,6 @@ class SyncManager(
     suspend fun runOnce(): SyncOutcome {
         return withContext(Dispatchers.IO) {
             val deviceCode = AppPreferences.deviceCode(context)
-            val activationCode = AppPreferences.activationCode(context)
             // Keep the existing protocol key; fixed station membership and count come from the server.
             val collectionMode = "MONITOR_BAIDU_MIN240_499"
             var claimedTask: RemoteTaskDto? = null
@@ -62,27 +59,7 @@ class SyncManager(
                 reportStatus("正在连接百度采集服务器")
                 api = RetrofitClient.serverApi(AppPreferences.serverUrl(context), context)
                 val activeApi = api
-                val registerResponse = activeApi.register(
-                    DeviceRegisterRequest(
-                        activationCode = activationCode,
-                        deviceCode = deviceCode,
-                        name = Build.MODEL,
-                        appVersion = CollectorVersions.APP_VERSION,
-                        parserVersion = CollectorVersions.PARSER_VERSION,
-                        targetAppVersion = "",
-                        capabilities = mapOf(
-                            "accessibilityConnected" to ChargingAccessibilityService.isConnected(),
-                            "targetPackage" to ChargingAccessibilityService.AMAP_PACKAGE,
-                            "fleetStopSupported" to true,
-                            "sdkInt" to Build.VERSION.SDK_INT,
-                            "manufacturer" to Build.MANUFACTURER,
-                            "model" to Build.MODEL,
-                        ),
-                    )
-                )
-                if (registerResponse.deviceToken.isNotBlank()) {
-                    AppPreferences.saveDeviceToken(context, registerResponse.deviceToken)
-                }
+                val registerResponse = DeviceRegistrationClient.register(context)
                 val scopeCount = registerResponse.priorityStationScopes?.get("BAIDU_MIN240_499")
                 if (scopeCount == null || scopeCount <= 0) {
                     throw IllegalStateException("服务器尚未提供有效的百度固定名单循环调度，请先更新服务器")
@@ -94,11 +71,7 @@ class SyncManager(
                         appVersion = CollectorVersions.APP_VERSION,
                         parserVersion = CollectorVersions.PARSER_VERSION,
                         targetAppVersion = "",
-                        capabilities = mapOf(
-                            "accessibilityConnected" to ChargingAccessibilityService.isConnected(),
-                            "targetPackage" to ChargingAccessibilityService.AMAP_PACKAGE,
-                            "fleetStopSupported" to true,
-                        ),
+                        capabilities = collectorCapabilities(context),
                     )
                 )
 
@@ -496,27 +469,7 @@ class SyncManager(
     suspend fun uploadLocalResultsOnly(): Int {
         val deviceCode = AppPreferences.deviceCode(context)
         val api = RetrofitClient.serverApi(AppPreferences.serverUrl(context), context)
-        val registerResponse = api.register(
-            DeviceRegisterRequest(
-                activationCode = AppPreferences.activationCode(context),
-                deviceCode = deviceCode,
-                name = Build.MODEL,
-                appVersion = CollectorVersions.APP_VERSION,
-                parserVersion = CollectorVersions.PARSER_VERSION,
-                targetAppVersion = "",
-                capabilities = mapOf(
-                    "accessibilityConnected" to ChargingAccessibilityService.isConnected(),
-                    "targetPackage" to ChargingAccessibilityService.AMAP_PACKAGE,
-                            "fleetStopSupported" to true,
-                    "sdkInt" to Build.VERSION.SDK_INT,
-                    "manufacturer" to Build.MANUFACTURER,
-                    "model" to Build.MODEL,
-                ),
-            )
-        )
-        if (registerResponse.deviceToken.isNotBlank()) {
-            AppPreferences.saveDeviceToken(context, registerResponse.deviceToken)
-        }
+        DeviceRegistrationClient.register(context)
         return uploadPendingResults(api, deviceCode, "", leaseToken = "")
     }
 

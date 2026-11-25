@@ -6,6 +6,7 @@ import com.google.gson.Strictness
 import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.io.StringReader
 import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.Call
@@ -17,6 +18,14 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+
+internal enum class RecoveryModelStatus { DECISION, HTTP_ERROR, NETWORK_ERROR, INVALID_RESPONSE, TIMEOUT, CANCELLED }
+
+internal data class RecoveryModelResult(
+    val status: RecoveryModelStatus,
+    val recommendation: RecoveryRecommendation? = null,
+    val httpStatus: Int? = null,
+)
 
 internal object DeepSeekRecoveryClient {
     const val MODEL = "deepseek-v4-flash"
@@ -55,7 +64,11 @@ internal object DeepSeekRecoveryClient {
         ),
     ))
 
-    suspend fun decide(key: String, evidence: RecoveryEvidence): RecoveryRecommendation? = suspendCancellableCoroutine { continuation ->
+    suspend fun decide(
+        key: String,
+        evidence: RecoveryEvidence,
+        onEnqueued: () -> Unit,
+    ): RecoveryModelResult = suspendCancellableCoroutine { continuation ->
         val request = Request.Builder().url("https://api.deepseek.com/chat/completions")
             .header("Authorization", "Bearer $key")
             .post(requestBody(evidence).toRequestBody("application/json".toMediaType())).build()
@@ -63,23 +76,29 @@ internal object DeepSeekRecoveryClient {
         continuation.invokeOnCancellation { call.cancel() }
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                continuation.resume(null)
+                val status = if (e is InterruptedIOException) RecoveryModelStatus.TIMEOUT else RecoveryModelStatus.NETWORK_ERROR
+                continuation.resume(RecoveryModelResult(status))
             }
 
             override fun onResponse(call: Call, response: Response) {
-                val decision = response.use {
-                    if (!it.isSuccessful) return@use null
+                val result = response.use {
+                    if (!it.isSuccessful) return@use RecoveryModelResult(RecoveryModelStatus.HTTP_ERROR, httpStatus = it.code)
                     try {
-                        val source = it.body?.source() ?: return@use null
-                        if (source.request(MAX_RESPONSE_BYTES + 1)) return@use null
-                        parse(source.readUtf8(), evidence.allowedActions, evidence.dialogNodes.filter { it.dismiss }.map { it.nodeId }.toSet())
-                    } catch (_: IOException) {
-                        null
+                        val source = it.body?.source()
+                        val decision = if (source != null && !source.request(MAX_RESPONSE_BYTES + 1)) {
+                            parse(source.readUtf8(), evidence.allowedActions, evidence.dialogNodes.filter { it.dismiss }.map { it.nodeId }.toSet())
+                        } else null
+                        val status = if (decision == null) RecoveryModelStatus.INVALID_RESPONSE else RecoveryModelStatus.DECISION
+                        RecoveryModelResult(status, decision, it.code)
+                    } catch (error: IOException) {
+                        val status = if (error is InterruptedIOException) RecoveryModelStatus.TIMEOUT else RecoveryModelStatus.NETWORK_ERROR
+                        RecoveryModelResult(status, httpStatus = it.code)
                     }
                 }
-                continuation.resume(decision)
+                continuation.resume(result)
             }
         })
+        onEnqueued()
     }
 
     fun parse(body: String, allowed: Set<RecoveryDecision>, dismissIds: Set<String> = emptySet()): RecoveryRecommendation? = try {

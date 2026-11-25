@@ -31,13 +31,20 @@ import com.tigercode.evcollector.recovery.BaiduUiBlockedException
 import com.tigercode.evcollector.recovery.DeepSeekKeyStore
 import com.tigercode.evcollector.recovery.DeepSeekRecoveryClient
 import com.tigercode.evcollector.recovery.RecoveryCause
+import com.tigercode.evcollector.recovery.RecoveryModelResult
+import com.tigercode.evcollector.recovery.RecoveryModelStatus
+import com.tigercode.evcollector.recovery.RecoveryOutcome
+import com.tigercode.evcollector.recovery.RecoveryTelemetry
 import com.tigercode.evcollector.recovery.RecoveryRateLimit
 import com.tigercode.evcollector.recovery.RecoveryStage
 import com.tigercode.evcollector.recovery.RecoveryStageWatchdog
-import com.tigercode.evcollector.recovery.returnToBaiduHome
+import com.tigercode.evcollector.recovery.BaiduHomeRecoveryStep
+import com.tigercode.evcollector.recovery.recoverBaiduHome
+import com.tigercode.evcollector.recovery.restartBaiduForAiRecovery
 import com.tigercode.evcollector.recovery.runBaiduAiFallback
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -428,44 +435,84 @@ class CollectionEngine(
         checkStop()
         if (!canRecover() || ShizukuMapController.isBusy || !aiRecoveryRate.tryAcquire(SystemClock.elapsedRealtime())) return false
         AppPreferences.appendLog(context, "DeepSeek 辅助判定: ${evidence.stage}/${evidence.cause}/${evidence.page}，可选关闭节点=${evidence.dialogNodes.count { it.dismiss }}")
-        val decision = withTimeoutOrNull(10_000L) { DeepSeekRecoveryClient.decide(key, evidence) }
-        currentCoroutineContext().ensureActive()
-        checkStop()
-        val firstAction = decision?.decision?.firstAction
-        if (firstAction == null) {
-            AppPreferences.appendLog(context, "DeepSeek 未返回可执行动作，保留原采集异常处理")
-            return false
-        }
-        fun canOperate(): Boolean = running && !stopRequested && canRecover() && !ShizukuMapController.isBusy &&
-            DeepSeekKeyStore.isConfigured(context) && ChargingAccessibilityService.current() === service
-        emit(CollectionState.PAUSED, "DeepSeek 暂停采集，正在处理异常并确认百度地图首页", 0, stationName)
-        val initial = if (canOperate()) service.readAiRecoveryScene() else null
-        if (initial == null || (initial != scene && !BaiduAiRecoveryPolicy.isHome(initial.snapshot))) {
-            AppPreferences.appendLog(context, "DeepSeek 建议未执行：页面已变更或不再满足操作条件")
-            throw BaiduAiRecoveryPausedException()
-        }
-        val home = returnToBaiduHome(
-            initial = initial,
-            firstAction = firstAction,
-            readScene = { if (canOperate()) service.readAiRecoveryScene() else null },
-            applyAction = { expected, action ->
-                val nodeId = decision.nodeId.takeIf { action == firstAction }
-                service.applyAiRecoveryAction(expected, action, nodeId, ::canOperate).also { applied ->
-                    if (applied) AppPreferences.appendLog(context, "DeepSeek 恢复：已提交${action.label}，重新确认百度页面")
-                    else AppPreferences.appendLog(context, "DeepSeek 恢复：未执行${action.label}，页面或控件校验未通过")
-                }
-            },
-            awaitNextRead = {
+        val telemetry = RecoveryTelemetry(context, evidence)
+        val modelStart = SystemClock.elapsedRealtime()
+        var modelResult = RecoveryModelResult(RecoveryModelStatus.CANCELLED)
+        var modelMs: Long? = null
+        var appliedActions = 0
+        var actionRejected = false
+        var outcome = RecoveryOutcome.NEEDS_REVIEW
+        try {
+            modelResult = withTimeoutOrNull(10_000L) {
+                DeepSeekRecoveryClient.decide(key, evidence, telemetry::requested)
+            } ?: RecoveryModelResult(RecoveryModelStatus.TIMEOUT)
+            modelMs = SystemClock.elapsedRealtime() - modelStart
+            currentCoroutineContext().ensureActive()
+            checkStop()
+            val decision = modelResult.recommendation
+            val firstAction = decision?.decision?.firstAction
+            if (firstAction == null) {
+                outcome = RecoveryOutcome.NO_ACTION
+                AppPreferences.appendLog(context, "DeepSeek 未返回可执行动作，保留原采集异常处理")
+                return false
+            }
+            fun recoveryIsActive(): Boolean = running && !stopRequested && canRecover() &&
+                DeepSeekKeyStore.isConfigured(context) && ChargingAccessibilityService.current() === service
+            fun canOperate(): Boolean = recoveryIsActive() && !ShizukuMapController.isBusy
+            suspend fun awaitRecoveryRead() {
                 delay(500L)
                 checkStop()
-            },
-        )
-        checkStop()
-        if (home == null || !canOperate()) {
-            throw BaiduAiRecoveryPausedException()
+            }
+            emit(CollectionState.PAUSED, "DeepSeek 暂停采集，正在处理异常并确认百度地图首页", 0, stationName)
+            val home = recoverBaiduHome(
+                initial = scene,
+                firstAction = firstAction,
+                readScene = { if (canOperate()) service.readAiRecoveryScene() else null },
+                applyAction = { expected, action ->
+                    val nodeId = decision.nodeId.takeIf { action == firstAction }
+                    service.applyAiRecoveryAction(expected, action, nodeId, ::canOperate).also { applied ->
+                        if (applied) {
+                            appliedActions++
+                            AppPreferences.appendLog(context, "DeepSeek 恢复：已提交${action.label}，重新确认百度页面")
+                        } else {
+                            actionRejected = true
+                            AppPreferences.appendLog(context, "DeepSeek 恢复：未执行${action.label}，页面或控件校验未通过")
+                        }
+                    }
+                },
+                restartMap = {
+                    restartBaiduForAiRecovery(context, service, ::recoveryIsActive, ::awaitRecoveryRead)
+                },
+                canOperate = ::canOperate,
+                awaitNextRead = ::awaitRecoveryRead,
+                onStep = { step ->
+                    val message = when (step) {
+                        BaiduHomeRecoveryStep.RETRY_RETURN -> "DeepSeek 恢复：首次未确认首页，重新尝试返回首页"
+                        BaiduHomeRecoveryStep.RESTART_MAP -> "DeepSeek 恢复：两次返回未确认首页，尝试通过 Shizuku 重启百度地图"
+                        BaiduHomeRecoveryStep.WAIT_RESTART_HOME -> "DeepSeek 恢复：百度地图已重开，等待并确认首页"
+                    }
+                    AppPreferences.appendLog(context, message)
+                    emit(CollectionState.PAUSED, message, 0, stationName)
+                },
+            )
+            checkStop()
+            if (home == null || !canOperate()) {
+                if (actionRejected && appliedActions == 0) outcome = RecoveryOutcome.REJECTED
+                AppPreferences.appendLog(context, "DeepSeek 恢复：返回重试及重启兜底后仍未确认首页，暂停并保留人工处理入口")
+                throw BaiduAiRecoveryPausedException()
+            }
+            emit(CollectionState.SCANNING_RESULTS, "DeepSeek 恢复：已确认百度地图首页，继续采集当前站点", 0, stationName)
+            outcome = RecoveryOutcome.RESUMED
+            return true
+        } catch (error: CancellationException) {
+            outcome = RecoveryOutcome.CANCELLED
+            throw error
+        } catch (error: StopRequestedException) {
+            outcome = RecoveryOutcome.CANCELLED
+            throw error
+        } finally {
+            telemetry.finish(outcome, modelResult, modelMs ?: (SystemClock.elapsedRealtime() - modelStart), appliedActions)
         }
-        emit(CollectionState.SCANNING_RESULTS, "DeepSeek 恢复：已确认百度地图首页，继续采集当前站点", 0, stationName)
-        return true
     }
 
     private suspend fun <T : Any> runRecoveryStage(stage: RecoveryStage, block: suspend () -> T): T {
